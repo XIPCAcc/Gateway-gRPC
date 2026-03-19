@@ -1,0 +1,41 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test results
+results/
+*.log
+*.csv
+*.json
+!*.proto
+
+# Profiling
+perf.data
+perf.data.old
+*.svg
+flamegraph*.svg
+
+# Shared memory
+/dev/shm/gateway_*
+/tmp/gateway.sock
+
+# Environment
+.env
+.env.local
+
+# Build artifacts
+*.o
+*.so
+*.a

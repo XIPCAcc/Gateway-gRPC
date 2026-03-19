@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["./backend", "--addr", "0.0.0.0:50051", "--delay-us", "1000"]
+    ports:
+      - "50051:50051"
+    networks:
+      - benchmark-net
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:50051/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  gateway-tcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["./gateway", "--listen-addr", "0.0.0.0:8080", "--backend-addr", "backend:50051", "--transport", "tcp"]
+    ports:
+      - "8080:8080"
+    networks:
+      - benchmark-net
+    depends_on:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["./benchmark", "suite", "--gateway-url", "http://gateway-tcp:8080", "--backend-addr", "http://backend:50051"]
+    networks:
+      - benchmark-net
+    depends_on:
+      - gateway-tcp
+    volumes:
+      - ./results:/app/results
+    profiles:
+      - benchmark
+
+networks:
+  benchmark-net:
+    driver: bridge

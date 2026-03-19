@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package echo;
+
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  rpc Compute(ComputeRequest) returns (ComputeResponse);
+  rpc StreamEcho(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+  int64 timestamp_ns = 2;
+  bytes payload = 3;
+}
+
+message EchoResponse {
+  string message = 1;
+  int64 timestamp_ns = 2;
+  int64 processing_time_us = 3;
+  bytes payload = 4;
+}
+
+message ComputeRequest {
+  int32 iterations = 1;
+  double input_value = 2;
+  int64 timestamp_ns = 3;
+}
+
+message ComputeResponse {
+  double result = 1;
+  int64 timestamp_ns = 2;
+  int64 processing_time_us = 3;
+}

@@ -1,0 +1,34 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+[[bin]]
+name = "latency_analyzer"
+path = "src/latency_analyzer.rs"
+
+[dependencies]
+proto = { path = "../proto" }
+shared-memory = { path = "../shared-memory" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.11", features = ["json"] }
+futures = { workspace = true }
+hdrhistogram = "7.5"
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+tokio-metrics = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
