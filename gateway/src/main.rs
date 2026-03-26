@@ -21,6 +21,11 @@ use tracing::{error, info, warn};
 mod transport;
 mod metrics;
 
+#[cfg(target_os = "linux")]
+mod shm_transport_uds;
+#[cfg(target_os = "linux")]
+mod shm_transport_eventfd;
+
 use metrics::Metrics;
 use transport::Transport;
 
@@ -75,6 +80,10 @@ enum TransportType {
     Tcp,
     Uds,
     Shm,
+    #[cfg(target_os = "linux")]
+    ShmUds,
+    #[cfg(target_os = "linux")]
+    ShmEventfd,
 }
 
 /// Gateway service that forwards HTTP requests to gRPC backend
@@ -228,6 +237,16 @@ async fn main() -> Result<()> {
         TransportType::Shm => {
             info!("Using Shared Memory transport with name {}", args.shm_name);
             Arc::new(transport::TransportEnum::Shm(transport::ShmTransport::new(&args.shm_name).await?))
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::ShmUds => {
+            info!("Using SHM transport with UDS notification (name: {})", args.shm_name);
+            Arc::new(transport::TransportEnum::ShmUds(transport::ShmTransportUds::new(&args.shm_name).await?))
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::ShmEventfd => {
+            info!("Using Eventfd Shared Memory transport with name {}", args.shm_name);
+            Arc::new(transport::TransportEnum::ShmEventfd(transport::ShmTransportEventfd::new(&args.shm_name).await?))
         }
     };
 

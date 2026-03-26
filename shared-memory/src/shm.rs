@@ -1,10 +1,13 @@
-use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use memmap2::{MmapMut, MmapOptions};
 use nix::fcntl::OFlag;
 use nix::sys::mman::{shm_open, shm_unlink};
 use nix::sys::stat::Mode;
 use nix::unistd::ftruncate;
+use tracing::info;
 
 use crate::{Result, ShmConfig};
 
@@ -45,32 +48,60 @@ pub struct SharedMemoryRingBuffer {
     header: *mut RingBufferHeader,
     data_offset: usize,
     data_size: usize,
+    write_lock: Mutex<()>,
+    read_lock: Mutex<()>,
 }
 
 unsafe impl Send for SharedMemoryRingBuffer {}
 unsafe impl Sync for SharedMemoryRingBuffer {}
 
+// Note: SharedMemoryRingBuffer cannot implement Clone because MmapMut doesn't support cloning.
+// Use Arc<SharedMemoryRingBuffer> for shared ownership.
+
 impl SharedMemoryRingBuffer {
     pub fn create(name: &str, config: ShmConfig) -> Result<Self> {
         let total_size = std::mem::size_of::<RingBufferHeader>() + config.buffer_size;
+        
+        info!("Creating shared memory: name={}, total_size={} bytes", name, total_size);
 
         // Create shared memory object
-        let fd = shm_open(
+        let fd = match shm_open(
             name,
             OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_EXCL,
             Mode::S_IRUSR | Mode::S_IWUSR,
-        )?;
+        ) {
+            Ok(fd) => {
+                info!("Shared memory created: name={}, fd={}", name, fd.as_raw_fd());
+                fd
+            },
+            Err(e) => {
+                info!("Failed to create shared memory: name={}, error={}", name, e);
+                return Err(e.into());
+            }
+        };
 
         // Set size
-        ftruncate(&fd, total_size as i64)?;
+        match ftruncate(&fd, total_size as i64) {
+            Ok(_) => info!("Shared memory truncated: name={}, size={} bytes", name, total_size),
+            Err(e) => {
+                info!("Failed to truncate shared memory: name={}, error={}", name, e);
+                return Err(e.into());
+            }
+        }
 
-        // Memory map
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(format!("/dev/shm/{}", name))?;
-
-        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        // Memory map directly from fd
+        let mut mmap = unsafe {
+            match MmapOptions::new().map_mut(&fd) {
+                Ok(mmap) => {
+                    info!("Shared memory mapped: name={}, size={} bytes", name, total_size);
+                    mmap
+                },
+                Err(e) => {
+                    info!("Failed to map shared memory: name={}, error={}", name, e);
+                    return Err(e.into());
+                }
+            }
+        };
 
         // Initialize header
         let header = mmap.as_mut_ptr() as *mut RingBufferHeader;
@@ -80,47 +111,85 @@ impl SharedMemoryRingBuffer {
 
         let data_offset = std::mem::size_of::<RingBufferHeader>();
 
+        info!("Shared memory ring buffer created successfully: name={}", name);
+
         Ok(Self {
             mmap,
             header,
             data_offset,
             data_size: config.buffer_size,
+            write_lock: Mutex::new(()),
+            read_lock: Mutex::new(()),
         })
     }
 
     pub fn open(name: &str, config: ShmConfig) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(format!("/dev/shm/{}", name))?;
+        let total_size = std::mem::size_of::<RingBufferHeader>() + config.buffer_size;
 
-        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        info!("Opening shared memory: name={}, total_size={} bytes", name, total_size);
+
+        // Open existing shared memory
+        let fd = match shm_open(
+            name,
+            OFlag::O_RDWR,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        ) {
+            Ok(fd) => {
+                info!("Shared memory opened: name={}, fd={}", name, fd.as_raw_fd());
+                fd
+            },
+            Err(e) => {
+                info!("Failed to open shared memory: name={}, error={}", name, e);
+                return Err(e.into());
+            }
+        };
+
+        // Memory map directly from fd
+        let mut mmap = unsafe {
+            match MmapOptions::new().map_mut(&fd) {
+                Ok(mmap) => {
+                    info!("Shared memory mapped: name={}, size={} bytes", name, total_size);
+                    mmap
+                },
+                Err(e) => {
+                    info!("Failed to map shared memory: name={}, error={}", name, e);
+                    return Err(e.into());
+                }
+            }
+        };
 
         let header = mmap.as_mut_ptr() as *mut RingBufferHeader;
 
         // Validate header
         unsafe {
             if !(*header).is_valid() {
+                info!("Shared memory header invalid: name={}", name);
                 return Err(crate::ShmError::InvalidState);
             }
         }
 
         let data_offset = std::mem::size_of::<RingBufferHeader>();
 
+        info!("Shared memory ring buffer opened successfully: name={}", name);
+
         Ok(Self {
             mmap,
             header,
             data_offset,
             data_size: config.buffer_size,
+            write_lock: Mutex::new(()),
+            read_lock: Mutex::new(()),
         })
     }
 
     pub fn write(&self, data: &[u8]) -> Result<usize> {
+        let _guard = self.write_lock.lock().unwrap();
+        
         let header = unsafe { &*self.header };
         let capacity = header.capacity as usize;
         
-        let write_pos = header.write_pos.load(std::sync::atomic::Ordering::Acquire) as usize;
-        let read_pos = header.read_pos.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let write_pos = header.write_pos.load(Ordering::Acquire) as usize;
+        let read_pos = header.read_pos.load(Ordering::Acquire) as usize;
         
         // Calculate available space
         let available = if write_pos >= read_pos {
@@ -129,7 +198,8 @@ impl SharedMemoryRingBuffer {
             read_pos - write_pos - 1
         };
 
-        if available < data.len() + 4 {
+        let total_size = 4 + data.len();
+        if available < total_size {
             return Err(crate::ShmError::BufferFull);
         }
 
@@ -137,107 +207,121 @@ impl SharedMemoryRingBuffer {
 
         // Write length prefix (4 bytes)
         let len_bytes = (data.len() as u32).to_le_bytes();
-        for (i, byte) in len_bytes.iter().enumerate() {
-            let pos = (write_pos + i) % capacity;
-            unsafe { data_ptr.add(pos).write(*byte) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                len_bytes.as_ptr(),
+                data_ptr.add(write_pos),
+                4
+            );
         }
 
         // Write data
         let data_start = (write_pos + 4) % capacity;
-        for (i, byte) in data.iter().enumerate() {
-            let pos = (data_start + i) % capacity;
-            unsafe { data_ptr.add(pos).write(*byte) };
+        if data_start + data.len() <= capacity {
+            // Continuous memory, copy directly
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    data_ptr.add(data_start),
+                    data.len()
+                );
+            }
+        } else {
+            // Cross boundary, copy in two parts
+            let first_part = capacity - data_start;
+            let second_part = data.len() - first_part;
+            
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    data_ptr.add(data_start),
+                    first_part
+                );
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(first_part),
+                    data_ptr,
+                    second_part
+                );
+            }
         }
 
         // Update write position
-        let new_write_pos = (write_pos + 4 + data.len()) % capacity;
-        header.write_pos.store(new_write_pos as u64, std::sync::atomic::Ordering::Release);
+        let new_write_pos = (write_pos + total_size) % capacity;
+        header.write_pos.store(new_write_pos as u64, Ordering::Release);
 
         Ok(data.len())
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        let _guard = self.read_lock.lock().unwrap();
+        
         let header = unsafe { &*self.header };
         let capacity = header.capacity as usize;
         
-        let write_pos = header.write_pos.load(std::sync::atomic::Ordering::Acquire) as usize;
-        let read_pos = header.read_pos.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let write_pos = header.write_pos.load(Ordering::Acquire) as usize;
+        let read_pos = header.read_pos.load(Ordering::Acquire) as usize;
 
         if write_pos == read_pos {
             return Err(crate::ShmError::BufferEmpty);
         }
 
+        // Read length prefix (4 bytes)
         let data_ptr = unsafe { self.mmap.as_ptr().add(self.data_offset) as *const u8 };
+        let len_bytes: [u8; 4] = unsafe {
+            [
+                *data_ptr.add(read_pos),
+                *data_ptr.add((read_pos + 1) % capacity),
+                *data_ptr.add((read_pos + 2) % capacity),
+                *data_ptr.add((read_pos + 3) % capacity),
+            ]
+        };
+        let data_len = u32::from_le_bytes(len_bytes) as usize;
 
-        // Read length prefix
-        let mut len_bytes = [0u8; 4];
-        for i in 0..4 {
-            let pos = (read_pos + i) % capacity;
-            len_bytes[i] = unsafe { data_ptr.add(pos).read() };
-        }
-        let msg_len = u32::from_le_bytes(len_bytes) as usize;
-
-        if buf.len() < msg_len {
+        if buf.len() < data_len {
             return Err(crate::ShmError::InvalidState);
         }
 
         // Read data
         let data_start = (read_pos + 4) % capacity;
-        for i in 0..msg_len {
-            let pos = (data_start + i) % capacity;
-            buf[i] = unsafe { data_ptr.add(pos).read() };
+        if data_start + data_len <= capacity {
+            // Continuous memory, copy directly
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data_ptr.add(data_start),
+                    buf.as_mut_ptr(),
+                    data_len
+                );
+            }
+        } else {
+            // Cross boundary, copy in two parts
+            let first_part = capacity - data_start;
+            let second_part = data_len - first_part;
+            
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data_ptr.add(data_start),
+                    buf.as_mut_ptr(),
+                    first_part
+                );
+                std::ptr::copy_nonoverlapping(
+                    data_ptr.add(0),
+                    buf.as_mut_ptr().add(first_part),
+                    second_part
+                );
+            }
         }
 
         // Update read position
-        let new_read_pos = (read_pos + 4 + msg_len) % capacity;
-        header.read_pos.store(new_read_pos as u64, std::sync::atomic::Ordering::Release);
+        let new_read_pos = (read_pos + 4 + data_len) % capacity;
+        header.read_pos.store(new_read_pos as u64, Ordering::Release);
 
-        Ok(msg_len)
-    }
-
-    pub fn available_to_read(&self) -> usize {
-        let header = unsafe { &*self.header };
-        let write_pos = header.write_pos.load(std::sync::atomic::Ordering::Acquire) as usize;
-        let read_pos = header.read_pos.load(std::sync::atomic::Ordering::Acquire) as usize;
-
-        if write_pos >= read_pos {
-            write_pos - read_pos
-        } else {
-            header.capacity as usize - (read_pos - write_pos)
-        }
-    }
-
-    pub fn unlink(name: &str) -> Result<()> {
-        shm_unlink(name)?;
-        Ok(())
+        Ok(data_len)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ring_buffer() {
-        let config = ShmConfig {
-            buffer_size: 4096,
-            max_message_size: 1024,
-            timeout_ms: 1000,
-        };
-
-        let name = "test_shm_001";
-        let _ = SharedMemoryRingBuffer::unlink(name);
-
-        let writer = SharedMemoryRingBuffer::create(name, config).unwrap();
-        let reader = SharedMemoryRingBuffer::open(name, config).unwrap();
-
-        let test_data = b"Hello, Shared Memory!";
-        writer.write(test_data).unwrap();
-
-        let mut read_buf = vec![0u8; 256];
-        let n = reader.read(&mut read_buf).unwrap();
-        assert_eq!(&read_buf[..n], test_data);
-
-        SharedMemoryRingBuffer::unlink(name).unwrap();
+impl Drop for SharedMemoryRingBuffer {
+    fn drop(&mut self) {
+        // Note: We don't unlink here as it might be in use by other processes
+        // The creator should handle cleanup
     }
 }

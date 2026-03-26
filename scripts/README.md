@@ -1,34 +1,114 @@
-# Benchmark Scripts
+# Test Scripts
 
-## Quick Start
+## Overview
+
+This directory contains scripts for testing different transport implementations in the gateway-gRPC project.
+
+## Available Scripts
+
+### Individual Transport Tests
+
+Each script tests a specific transport implementation:
+
+| Script | Transport | Description |
+|--------|-----------|-------------|
+| `run_tcp.sh` | TCP | Standard TCP socket transport |
+| `run_uds.sh` | UDS | Unix Domain Socket transport |
+| `run_shm.sh` | SHM | Shared Memory with polling |
+| `run_shm_uds.sh` | SHM-UDS | Shared Memory with UDS notification |
+| `run_shm_eventfd.sh` | SHM-Eventfd | Shared Memory with eventfd notification |
+
+### Comparison Tests
+
+| Script | Description |
+|--------|-------------|
+| `compare_all_transports.sh` | Tests all transport implementations and compares performance |
+
+## Usage
+
+### Run Individual Transport Test
 
 ```bash
-# Start services
-./scripts/start_services.sh [delay_us]
+# Basic usage (default: 1000us delay, 30s test duration)
+./scripts/run_tcp.sh
+./scripts/run_uds.sh
+./scripts/run_shm.sh
+./scripts/run_shm_uds.sh
+./scripts/run_shm_eventfd.sh
 
-# Run benchmarks
-./scripts/run_wrk.sh              # wrk benchmark
-./scripts/run_ab.sh               # Apache Benchmark
-./scripts/run_hey.sh              # hey benchmark (requires hey)
-./scripts/run_ghz.sh              # ghz benchmark (requires ghz)
-
-# Stop services
-./scripts/stop_services.sh
+# Custom delay and test duration
+./scripts/run_tcp.sh 500 60        # 500us delay, 60s test
+./scripts/run_shm_eventfd.sh 2000 45  # 2000us delay, 45s test
 ```
 
-## Complete Benchmark Suite
-
-Run all available benchmarks:
+### Run All Transports Comparison
 
 ```bash
-./scripts/benchmark.sh [wrk|ab|hey|ghz|custom|all]
+# Test all transports with default settings
+./scripts/compare_all_transports.sh
 ```
+
+## Test Configuration
+
+Each test runs three concurrency levels:
+- **Low**: 64 connections
+- **Medium**: 256 connections
+- **High**: 1024 connections
+
+Default parameters:
+- Backend delay: 1000μs
+- Test duration: 30s per concurrency level
+- wrk threads: 8
+
+## Output
+
+### Log Directory
+
+All logs are saved to the `./log/` directory in the project root:
+
+```
+log/
+├── backend_tcp.log              # Backend logs
+├── gateway_tcp.log              # Gateway logs
+├── tcp_test_low.log            # Test results (64 connections)
+├── tcp_test_medium.log         # Test results (256 connections)
+├── tcp_test_high.log           # Test results (1024 connections)
+├── backend_uds.log
+├── gateway_uds.log
+├── uds_test_low.log
+├── uds_test_medium.log
+├── uds_test_high.log
+├── backend_shm.log
+├── gateway_shm.log
+├── shm_test_low.log
+├── shm_test_medium.log
+├── shm_test_high.log
+├── backend_shm_uds.log
+├── gateway_shm_uds.log
+├── shm_uds_test_low.log
+├── shm_uds_test_medium.log
+├── shm_uds_test_high.log
+├── backend_shm_eventfd.log
+├── gateway_shm_eventfd.log
+├── shm_eventfd_test_low.log
+├── shm_eventfd_test_medium.log
+└── shm_eventfd_test_high.log
+```
+
+### Test Results
+
+Each test result file contains:
+- Request latency statistics (avg, stdev, min, max)
+- Requests per second (QPS)
+- Latency distribution (50%, 75%, 90%, 99%)
+- Transfer statistics
 
 ## Prerequisites
 
-### wrk
+### wrk (HTTP benchmarking tool)
+
 ```bash
-# Ubuntu
+# Ubuntu/Debian
 sudo apt-get install wrk
 
 # Build from source
@@ -37,66 +117,76 @@ cd wrk && make
 sudo cp wrk /usr/local/bin/
 ```
 
-### Apache Benchmark (ab)
+## Port Allocation
+
+Each transport uses a different gateway port:
+
+| Transport | Gateway Port |
+|-----------|---------------|
+| TCP | 8080 |
+| UDS | 8081 |
+| SHM | 8082 |
+| SHM-UDS | 8083 |
+| SHM-Eventfd | 8084 |
+
+## Troubleshooting
+
+### Port Already in Use
+
+If you see "Address already in use" error:
 ```bash
-# Ubuntu
-sudo apt-get install apache2-utils
+# Kill existing processes
+pkill -9 backend
+pkill -9 gateway
 ```
 
-### hey
-```bash
-# Go install
-go install github.com/rakyll/hey@latest
+### Shared Memory Cleanup
 
-# Or download binary
-# https://github.com/rakyll/hey/releases
+If SHM tests fail:
+```bash
+# Clean up shared memory
+rm -f /dev/shm/backend_*
+
+# Clean up sockets
+rm -f /tmp/backend*.sock
 ```
 
-### ghz
-```bash
-# Go install
-go install github.com/bojand/ghz/cmd/ghz@latest
+### View Logs
 
-# Or download binary
-# https://github.com/bojand/ghz/releases
+Check logs for errors:
+```bash
+# View backend log
+cat log/backend_tcp.log
+
+# View gateway log
+cat log/gateway_tcp.log
+
+# View test results
+cat log/tcp_test_high.log
 ```
 
-## Usage Examples
+## Performance Comparison
 
-### Start services with custom delay
+After running `compare_all_transports.sh`, you can compare results:
+
 ```bash
-./scripts/start_services.sh 100  # 100us delay
-./scripts/start_services.sh 1000 # 1ms delay
+# View all high-concurrency results
+cat log/*_test_high.log | grep "Requests/sec"
+
+# Compare latency
+cat log/*_test_high.log | grep "Latency"
 ```
 
-### Run wrk with custom parameters
-```bash
-# Default: 64 256 512 1024 connections, 8 threads, 30s
-./scripts/run_wrk.sh "64 256" 8 10  # 64 and 256 connections, 8 threads, 10s
-```
+## Expected Performance
 
-### Run ab with custom parameters
-```bash
-# Default: 64 256 512 1024 connections, 30000 requests
-./scripts/run_ab.sh "64 256" 10000  # 64 and 256 connections, 10000 requests
-```
+Based on previous benchmarks:
 
-### Run hey with custom parameters
-```bash
-# Default: 64 256 512 1024 connections, 30s duration, 10000 QPS limit
-./scripts/run_hey.sh "64 256" 20s 5000
-```
+| Transport | QPS (1024 conn) | Avg Latency |
+|-----------|-------------------|-------------|
+| TCP | ~33.4K | ~30.66ms |
+| UDS | ~36.2K | ~28.19ms |
+| SHM | ~476 | ~833.36ms |
+| SHM-UDS | ~92K | ~11.07ms |
+| SHM-Eventfd | ~93.6K | ~10.87ms |
 
-### Run ghz with custom parameters
-```bash
-# Default: 64 256 512 1024 connections, 30000 calls
-./scripts/run_ghz.sh "64 256" 10000
-```
-
-## Results
-
-All results are saved in `./results/` directory with timestamps:
-- `./results/wrk_YYYYMMDD_HHMMSS/`
-- `./results/ab_YYYYMMDD_HHMMSS/`
-- `./results/hey_YYYYMMDD_HHMMSS/`
-- `./results/ghz_YYYYMMDD_HHMMSS/`
+Note: Actual performance may vary based on system configuration and workload.

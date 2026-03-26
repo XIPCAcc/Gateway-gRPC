@@ -14,6 +14,16 @@ use tracing::{info, warn};
 use shared_memory::shm::SharedMemoryRingBuffer;
 use shared_memory::ShmConfig as SharedMemConfig;
 
+#[cfg(target_os = "linux")]
+mod shm_server_uds;
+#[cfg(target_os = "linux")]
+use shm_server_uds::ShmServerUds;
+
+#[cfg(target_os = "linux")]
+mod shm_server_eventfd;
+#[cfg(target_os = "linux")]
+use shm_server_eventfd::ShmServerEventfd;
+
 lazy_static::lazy_static! {
     static ref REQUEST_COUNTER: Counter = register_counter!(
         "backend_requests_total",
@@ -54,6 +64,10 @@ enum TransportType {
     Tcp,
     Uds,
     Shm,
+    #[cfg(target_os = "linux")]
+    ShmUds,
+    #[cfg(target_os = "linux")]
+    ShmEventfd,
 }
 
 #[derive(Debug, Default)]
@@ -244,6 +258,36 @@ async fn main() -> Result<()> {
             // Run shared memory server loop
             run_shm_server(request_buffer, response_buffer, delay).await?;
         }
+        #[cfg(target_os = "linux")]
+        TransportType::ShmUds => {
+            let shm_name = &args.shm_name;
+            
+            info!(
+                "Starting backend server on SHM with UDS notification (name: {}) with delay {}us",
+                shm_name, args.delay_us
+            );
+
+            // Create SHM server with UDS notification
+            let server = ShmServerUds::new(shm_name)?;
+            
+            // Run server
+            server.run(delay).await?;
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::ShmEventfd => {
+            let shm_name = &args.shm_name;
+            
+            info!(
+                "Starting backend server on eventfd SHM (name: {}) with delay {}us",
+                shm_name, args.delay_us
+            );
+
+            // Create eventfd-based SHM server
+            let server = ShmServerEventfd::new(shm_name)?;
+            
+            // Run server
+            server.run(delay).await?;
+        }
     }
 
     Ok(())
@@ -292,8 +336,8 @@ async fn run_shm_server(
             }
             Err(_) => {
                 // No data available, yield to Tokio runtime
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_micros(50)).await;
+                // tokio::task::yield_now().await;
+                // tokio::time::sleep(Duration::from_micros(50)).await;
             }
         }
     }

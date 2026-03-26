@@ -22,6 +22,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio-metrics = "0.3"
 async-stream = "0.3"
+nix = { workspace = true }
+bincode = "1.3"
 
 [features]
 default = ["fixed-delay"]

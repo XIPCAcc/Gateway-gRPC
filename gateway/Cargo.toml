@@ -33,6 +33,8 @@ futures = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
+nix = { workspace = true }
+bincode = "1.3"
 
 [features]
 default = ["tcp", "uds", "shm"]

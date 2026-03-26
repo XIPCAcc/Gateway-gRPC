@@ -13,6 +13,11 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info};
 
+#[cfg(target_os = "linux")]
+pub use crate::shm_transport_uds::ShmTransportUds;
+#[cfg(target_os = "linux")]
+pub use crate::shm_transport_eventfd::ShmTransportEventfd;
+
 /// Transport trait for different backend communication methods
 #[async_trait]
 pub trait Transport: Send + Sync {
@@ -161,8 +166,8 @@ impl Transport for ShmTransport {
                     Ok(n) => n,
                     Err(_) => {
                         // No data available, yield to Tokio runtime
-                        tokio::task::yield_now().await;
-                        tokio::time::sleep(Duration::from_micros(50)).await;
+                        // tokio::task::yield_now().await;
+                        // tokio::time::sleep(Duration::from_micros(50)).await;
                         continue;
                     }
                 }
@@ -184,6 +189,10 @@ pub enum TransportEnum {
     Tcp(TcpTransport),
     Uds(UdsTransport),
     Shm(ShmTransport),
+    #[cfg(target_os = "linux")]
+    ShmUds(ShmTransportUds),
+    #[cfg(target_os = "linux")]
+    ShmEventfd(ShmTransportEventfd),
 }
 
 #[async_trait]
@@ -193,6 +202,10 @@ impl Transport for TransportEnum {
             TransportEnum::Tcp(t) => t.call(request).await,
             TransportEnum::Uds(t) => t.call(request).await,
             TransportEnum::Shm(t) => t.call(request).await,
+            #[cfg(target_os = "linux")]
+            TransportEnum::ShmUds(t) => t.call(request).await,
+            #[cfg(target_os = "linux")]
+            TransportEnum::ShmEventfd(t) => t.call(request).await,
         }
     }
 }

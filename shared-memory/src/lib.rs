@@ -1,11 +1,8 @@
 pub mod eventfd;
 pub mod shm;
-pub mod uintr;
-pub mod channel;
 
 pub use eventfd::*;
 pub use shm::*;
-pub use channel::*;
 
 use thiserror::Error;
 
@@ -46,7 +43,7 @@ pub struct ShmConfig {
 impl Default for ShmConfig {
     fn default() -> Self {
         Self {
-            buffer_size: 1024 * 1024, // 1MB
+            buffer_size: 64 * 1024 * 1024, // 64MB
             max_message_size: 64 * 1024, // 64KB
             timeout_ms: 5000,
         }
