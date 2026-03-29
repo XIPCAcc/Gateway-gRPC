@@ -1,0 +1,3 @@
+[submodule "uintr"]
+	path = uintr
+	url = ./uintr
