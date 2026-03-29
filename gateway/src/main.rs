@@ -25,6 +25,13 @@ mod metrics;
 mod shm_transport_uds;
 #[cfg(target_os = "linux")]
 mod shm_transport_eventfd;
+#[cfg(target_os = "linux")]
+mod shm_transport_uintr;
+
+#[cfg(target_os = "linux")]
+mod uintr_client;
+#[cfg(target_os = "linux")]
+use uintr_client::UintrClient;
 
 use metrics::Metrics;
 use transport::Transport;
@@ -84,6 +91,10 @@ enum TransportType {
     ShmUds,
     #[cfg(target_os = "linux")]
     ShmEventfd,
+    #[cfg(target_os = "linux")]
+    ShmUintr,
+    #[cfg(target_os = "linux")]
+    Uintr,
 }
 
 /// Gateway service that forwards HTTP requests to gRPC backend
@@ -217,6 +228,7 @@ async fn run_http_server(
 }
 
 #[tokio::main]
+// #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -247,6 +259,16 @@ async fn main() -> Result<()> {
         TransportType::ShmEventfd => {
             info!("Using Eventfd Shared Memory transport with name {}", args.shm_name);
             Arc::new(transport::TransportEnum::ShmEventfd(transport::ShmTransportEventfd::new(&args.shm_name).await?))
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::ShmUintr => {
+            info!("Using SHM transport with UINTR notification (name: {})", args.shm_name);
+            Arc::new(transport::TransportEnum::ShmUintr(transport::ShmTransportUintr::new(&args.shm_name).await?))
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::Uintr => {
+            info!("Using SHM transport with UINTR notification (name: {})", args.shm_name);
+            Arc::new(transport::TransportEnum::ShmUintr(transport::ShmTransportUintr::new(&args.shm_name).await?))
         }
     };
 

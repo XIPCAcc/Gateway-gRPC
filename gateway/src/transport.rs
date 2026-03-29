@@ -17,6 +17,8 @@ use tracing::{debug, info};
 pub use crate::shm_transport_uds::ShmTransportUds;
 #[cfg(target_os = "linux")]
 pub use crate::shm_transport_eventfd::ShmTransportEventfd;
+#[cfg(target_os = "linux")]
+pub use crate::shm_transport_uintr::ShmTransportUintr;
 
 /// Transport trait for different backend communication methods
 #[async_trait]
@@ -193,6 +195,8 @@ pub enum TransportEnum {
     ShmUds(ShmTransportUds),
     #[cfg(target_os = "linux")]
     ShmEventfd(ShmTransportEventfd),
+    #[cfg(target_os = "linux")]
+    ShmUintr(ShmTransportUintr),
 }
 
 #[async_trait]
@@ -206,6 +210,8 @@ impl Transport for TransportEnum {
             TransportEnum::ShmUds(t) => t.call(request).await,
             #[cfg(target_os = "linux")]
             TransportEnum::ShmEventfd(t) => t.call(request).await,
+            #[cfg(target_os = "linux")]
+            TransportEnum::ShmUintr(t) => t.call(request).await,
         }
     }
 }

@@ -24,6 +24,16 @@ mod shm_server_eventfd;
 #[cfg(target_os = "linux")]
 use shm_server_eventfd::ShmServerEventfd;
 
+#[cfg(target_os = "linux")]
+mod shm_server_uintr;
+#[cfg(target_os = "linux")]
+use shm_server_uintr::ShmServerUintr;
+
+#[cfg(target_os = "linux")]
+mod uintr_server;
+#[cfg(target_os = "linux")]
+use uintr_server::UintrServer;
+
 lazy_static::lazy_static! {
     static ref REQUEST_COUNTER: Counter = register_counter!(
         "backend_requests_total",
@@ -68,6 +78,10 @@ enum TransportType {
     ShmUds,
     #[cfg(target_os = "linux")]
     ShmEventfd,
+    #[cfg(target_os = "linux")]
+    ShmUintr,
+    #[cfg(target_os = "linux")]
+    Uintr,
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +195,7 @@ impl EchoServiceTrait for EchoServiceImpl {
 }
 
 #[tokio::main]
+// #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -287,6 +302,36 @@ async fn main() -> Result<()> {
             
             // Run server
             server.run(delay).await?;
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::ShmUintr => {
+            let shm_name = &args.shm_name;
+            
+            info!(
+                "Starting backend server on SHM with UINTR notification (name: {}) with delay {}us",
+                shm_name, args.delay_us
+            );
+
+            // Create SHM server with UINTR notification
+            let server = ShmServerUintr::new(shm_name)?;
+            
+            // Run server
+            server.run(delay).await?;
+        }
+        #[cfg(target_os = "linux")]
+        TransportType::Uintr => {
+            let socket_path = &args.uds_path;
+            
+            info!(
+                "Starting backend server on UINTR (socket: {}) with delay {}us",
+                socket_path, args.delay_us
+            );
+
+            // Create UINTR server
+            let mut server = UintrServer::new(socket_path);
+            
+            // Run UINTR test
+            server.run_test(10).await.map_err(|e| anyhow::anyhow!("UINTR test failed: {}", e))?;
         }
     }
 
