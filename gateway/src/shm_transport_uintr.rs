@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use proto::{EchoRequest, EchoResponse};
 use shared_memory::shm::SharedMemoryRingBuffer;
-use shared_memory::ShmConfig;
+use shared_memory::{ShmConfig, ShmError};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
@@ -16,9 +16,10 @@ use nix::libc;
 use crate::transport::Transport;
 
 use uintr::{UintrError, UintrResult};
-use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sender, senduipi, stui, uintr_wait};
+use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sender, senduipi, stui};
 use uintr::connection::setup_client_connection;
-use uintr::{UINTR_HANDLER_FLAG_WAITING_ANY, UINTR_WAIT_MAX_USEC};
+use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
+use uintr::async_wait::{init_token, get_token, process_uintr_wakers, uintr_wait};
 
 type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<Result<EchoResponse>>>>>;
 
@@ -75,19 +76,23 @@ impl ShmTransportUintr {
 
         let uipi_index = Self::setup_uintr(&socket_path).await?;
 
+        let token = get_token()
+            .map_err(|e| anyhow::anyhow!("Failed to get token: {}", e))?;
+        
+        tokio::spawn({
+            let token = token.clone();
+            async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(5));
+                loop {
+                    interval.tick().await;
+                    process_uintr_wakers(token.clone());
+                }
+            }
+        });
+
         let pending_requests_clone2 = pending_requests_clone.clone();
         tokio::spawn(async move {
             let mut response_buf = vec![0u8; 131072];
-            
-            // 在后台线程中重新注册 UINTR 处理程序
-            // let _ = uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY)
-            //     .map_err(|e| {
-            //         warn!("Failed to register UINTR handler in background thread: {}", e);
-            //         e
-            //     });
-            // unsafe {
-            //     stui();
-            // }
             
             info!("UINTR response listener thread started");
             
@@ -95,7 +100,7 @@ impl ShmTransportUintr {
                 debug!("Waiting for UINTR notification...");
                 info!("Response listener: 等待 UINTR 响应通知...");
                 
-                match Self::wait_for_uintr() {
+                match Self::wait_for_uintr().await {
                     Ok(_) => {
                         debug!("Received UINTR notification");
                         info!("Response listener: 收到 UINTR 响应通知");
@@ -110,14 +115,18 @@ impl ShmTransportUintr {
                 loop {
                     let n = match response_buffer_clone.read(&mut response_buf) {
                         Ok(n) => n,
-                        Err(_) => {
-                            info!("Response listener: 没有更多数据可读");
+                        Err(ShmError::BufferEmpty) => {
+                            debug!("Response listener: 没有更多数据可读");
+                            break;
+                        },
+                        Err(e) => {
+                            warn!("Failed to read from shared memory: {}", e);
                             break;
                         }
                     };
                     
                     processed += 1;
-                    info!("Response listener: 读取到 {} 字节的数据", n);
+                    debug!("Response listener: 读取到 {} 字节的数据", n);
                     
                     let (request_id, response): (String, EchoResponse) = 
                         match bincode::deserialize(&response_buf[..n]) {
@@ -128,12 +137,12 @@ impl ShmTransportUintr {
                             }
                         };
                     
-                    info!("Response listener: 收到请求 {} 的响应", request_id);
+                    debug!("Response listener: 收到请求 {} 的响应", request_id);
                     
                     let mut pending = pending_requests_clone2.lock().await;
                     if let Some(tx) = pending.remove(&request_id) {
                         let _ = tx.send(Ok(response));
-                        info!("Response listener: 已将响应发送给等待的请求 {}", request_id);
+                        debug!("Response listener: 已将响应发送给等待的请求 {}", request_id);
                     } else {
                         warn!("No pending request for ID: {}", request_id);
                     }
@@ -162,6 +171,8 @@ impl ShmTransportUintr {
     }
 
     async fn setup_uintr(socket_path: &str) -> Result<libc::c_int> {
+        init_token("client");
+        
         let res = uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY)
             .map_err(|e| anyhow::anyhow!("Failed to register UINTR handler: {}", e))?;
         info!("UINTR client: Interrupt handler registered successfully: {}", res);
@@ -204,18 +215,10 @@ impl ShmTransportUintr {
         Ok(())
     }
 
-    fn wait_for_uintr() -> Result<()> {
-        info!("wait_for_uintr: 开始等待 UINTR 中断...");
-        let mut iterations = 0;
-        while unsafe { uintr_received == 0 } {
-            iterations += 1;
-            if iterations % 100 == 0 {
-                info!("wait_for_uintr: 仍在等待中断，已等待 {} 次迭代", iterations);
-            }
-            uintr_wait(UINTR_WAIT_MAX_USEC, 0)?;
-        }
-        info!("wait_for_uintr: 收到 UINTR 中断，总迭代次数: {}", iterations);
-        unsafe { uintr_received = 0; }
+    async fn wait_for_uintr() -> Result<()> {
+        info!("wait_for_uintr: 开始异步等待 UINTR 中断...");
+        uintr_wait().await?;
+        info!("wait_for_uintr: 收到 UINTR 中断");
         Ok(())
     }
     
