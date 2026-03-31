@@ -126,7 +126,7 @@ impl ShmServerUintr {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(5));
                 loop {
                     interval.tick().await;
-                    process_uintr_wakers(token.clone());
+                    process_uintr_wakers(&token);
                 }
             }
         });
