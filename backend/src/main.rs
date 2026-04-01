@@ -9,6 +9,7 @@ use proto::echo_service_server::{EchoService as EchoServiceTrait, EchoServiceSer
 use proto::{ComputeRequest, ComputeResponse, EchoRequest, EchoResponse};
 use tonic::{transport::Server, Request, Response, Status};
 use tokio::net::UnixListener;
+use tokio::runtime::Builder;
 use tracing::{info, warn};
 
 use shared_memory::shm::SharedMemoryRingBuffer;
@@ -194,14 +195,27 @@ impl EchoServiceTrait for EchoServiceImpl {
     }
 }
 
-#[tokio::main]
-// #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let args = Args::parse();
+
+    let event_interval: u32 = std::env::var("TOKIO_EVENT_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+
+    let rt = Builder::new_multi_thread()
+        .event_interval(event_interval)
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> Result<()> {
     let delay = Duration::from_micros(args.delay_us);
     let echo_service = EchoServiceImpl::new(delay, args.compute_iterations);
 

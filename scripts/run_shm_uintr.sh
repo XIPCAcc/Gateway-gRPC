@@ -24,7 +24,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SHM_NAME="backend_uintr_${TIMESTAMP}"
 GATEWAY_ADDR="127.0.0.1:8085"
 DELAY_US=${1:-1000}
-TEST_DURATION=${2:-30}
+TEST_DURATION=${2:-10}
 
 echo "Configuration:"
 echo "  SHM Name: $SHM_NAME"
