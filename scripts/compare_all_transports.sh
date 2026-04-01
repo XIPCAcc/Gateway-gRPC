@@ -141,6 +141,11 @@ run_test "shm-eventfd" \
     "./target/release/backend --transport shm-eventfd --shm-name backend --delay-us $DELAY_US" \
     "./target/release/gateway --transport shm-eventfd --shm-name backend --listen-addr 127.0.0.1:$GATEWAY_PORT"
 
+# Test SHM-UINTR (UINTR notification)
+run_test "shm-uintr" \
+    "./target/release/backend --transport shm-uintr --shm-name backend --delay-us $DELAY_US" \
+    "./target/release/gateway --transport shm-uintr --shm-name backend --listen-addr 127.0.0.1:$GATEWAY_PORT"
+
 echo ""
 echo "=========================================="
 echo "All Tests Complete!"
