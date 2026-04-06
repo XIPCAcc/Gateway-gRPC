@@ -21,7 +21,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 
 [workspace.dependencies]
-tokio = { version = "1.35", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1.35", features = ["full", "rt-multi-thread", "uintr-core"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.12"
 prost = "0.13"

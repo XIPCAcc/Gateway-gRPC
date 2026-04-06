@@ -123,7 +123,7 @@ impl ShmServerUintr {
         tokio::spawn({
             let token = token.clone();
             async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(5));
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(3));
                 loop {
                     interval.tick().await;
                     process_uintr_wakers(&token);
