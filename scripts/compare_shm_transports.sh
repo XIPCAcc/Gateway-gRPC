@@ -7,8 +7,12 @@ set -e
 DELAY_US=1000
 SHM_NAME="backend"
 GATEWAY_PORT=8080
-LOG_DIR="log"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_DIR="log/${TIMESTAMP}"
 TEST_DURATION=30
+
+echo "Building project..."
+cargo build --release
 
 mkdir -p $LOG_DIR
 
