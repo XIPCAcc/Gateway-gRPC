@@ -7,10 +7,16 @@ set -e
 DELAY_US=1000
 SHM_NAME="backend"
 GATEWAY_PORT=8080
-LOG_DIR="log"
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+LOG_DIR="log/${TIMESTAMP}"
 TEST_DURATION=30
 
 mkdir -p $LOG_DIR
+
+# 重新编译
+echo "Recompiling..."
+cargo build --release
+echo "Compile complete!"
 
 pkill -9 backend 2>/dev/null || true
 pkill -9 gateway 2>/dev/null || true
@@ -30,13 +36,13 @@ run_test() {
     
     rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
     rm -f /tmp/${SHM_NAME}_*.sock 2>/dev/null || true
-    
-    $backend_cmd > $LOG_DIR/${name}_backend_${concurrency}.log 2>&1 &
+
+    $backend_cmd &
     BACKEND_PID=$!
-    
+
     sleep 3
-    
-    $gateway_cmd > $LOG_DIR/${name}_gateway_${concurrency}.log 2>&1 &
+
+    $gateway_cmd &
     GATEWAY_PID=$!
     
     sleep 2
@@ -53,21 +59,21 @@ run_test() {
     sleep 1
 }
 
-for concurrency in 64 256 1024; do
+for concurrency in 16 32 64 256 1024 4096; do
     run_test "shm-uds" \
         "./target/release/backend --transport shm-uds --shm-name $SHM_NAME --delay-us $DELAY_US" \
         "./target/release/gateway --transport shm-uds --shm-name $SHM_NAME --listen-addr 127.0.0.1:$GATEWAY_PORT" \
         $concurrency
 done
 
-for concurrency in 64 256 1024; do
+for concurrency in 16 32 64 256 1024 4096; do
     run_test "shm-eventfd" \
         "./target/release/backend --transport shm-eventfd --shm-name $SHM_NAME --delay-us $DELAY_US" \
         "./target/release/gateway --transport shm-eventfd --shm-name $SHM_NAME --listen-addr 127.0.0.1:$GATEWAY_PORT" \
         $concurrency
 done
 
-for concurrency in 64 256 1024; do
+for concurrency in 16 32 64 256 1024 4096; do
     run_test "shm-uintr" \
         "./target/release/backend --transport shm-uintr --shm-name $SHM_NAME --delay-us $DELAY_US" \
         "./target/release/gateway --transport shm-uintr --shm-name $SHM_NAME --listen-addr 127.0.0.1:$GATEWAY_PORT" \

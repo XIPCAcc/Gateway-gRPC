@@ -15,15 +15,16 @@ use uintr::{UintrError, UintrResult};
 use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sender, senduipi, stui};
 use uintr::connection::setup_server_connection;
 use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
-use uintr::async_wait::{init_token, get_token, process_uintr_wakers, uintr_wait};
+use uintr::async_wait::{init_token, get_token, uintr_wait};
 
 unsafe extern "C" {
     pub fn ui_handler(ui_frame: *mut uintr::syscall::UintrFrame, vector: u64);
-    static mut uintr_received: libc::c_ulong;
 }
 
 static mut SERVER_UINTRFD: RawFd = -1;
 static mut SERVER_UIPI_INDEX: libc::c_int = -1;
+static mut GLOBAL_REQUEST_COUNTER: u64 = 0;
+static mut GLOBAL_RESPONSE_COUNTER: u64 = 0;
 
 fn get_server_uintrfd() -> RawFd {
     unsafe { SERVER_UINTRFD }
@@ -119,17 +120,6 @@ impl ShmServerUintr {
 
         let token = get_token()
             .map_err(|e| anyhow::anyhow!("Failed to get token: {}", e))?;
-        
-        tokio::spawn({
-            let token = token.clone();
-            async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(5));
-                loop {
-                    interval.tick().await;
-                    process_uintr_wakers(&token);
-                }
-            }
-        });
 
         let response_buffer = self.response_buffer.clone();
         let request_buffer = Arc::new(self.request_buffer);
@@ -157,7 +147,11 @@ impl ShmServerUintr {
                     loop {
                         let n = match request_buffer.read(&mut request_buf) {
                             Ok(n) => {
-                                debug!("Request listener: 成功从共享内存读取 {} 字节", n);
+                                let global_req_id = unsafe {
+                                    GLOBAL_REQUEST_COUNTER += 1;
+                                    GLOBAL_REQUEST_COUNTER
+                                };
+                                debug!("Request listener: 成功从共享内存读取 {} 字节，请求全局编号: {}", n, global_req_id);
                                 n
                             },
                             Err(ShmError::BufferEmpty) => {
@@ -207,7 +201,13 @@ impl ShmServerUintr {
                             };
                             
                             let response_with_id = (request_id_clone.clone(), response);
-                            
+
+                            let global_resp_id = unsafe {
+                                GLOBAL_RESPONSE_COUNTER += 1;
+                                GLOBAL_RESPONSE_COUNTER
+                            };
+                            debug!("Response listener: 准备序列化响应，响应全局编号: {}", global_resp_id);
+
                             let payload = match bincode::serialize(&response_with_id) {
                                 Ok(data) => data,
                                 Err(e) => {

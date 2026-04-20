@@ -207,7 +207,7 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
 
-    let rt = Builder::new_multi_thread()
+    let rt = Builder::new_current_thread()
         .event_interval(event_interval)
         .enable_all()
         .build()?;
