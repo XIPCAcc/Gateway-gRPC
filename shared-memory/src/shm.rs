@@ -252,12 +252,32 @@ impl SharedMemoryRingBuffer {
         Ok(data.len())
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        let _guard = self.read_lock.lock().unwrap();
-        
+    pub fn is_empty(&self) -> bool {
+        let header = unsafe { &*self.header };
+        let write_pos = header.write_pos.load(Ordering::Acquire) as usize;
+        let read_pos = header.read_pos.load(Ordering::Acquire) as usize;
+        write_pos == read_pos
+    }
+
+    pub fn available_data(&self) -> usize {
         let header = unsafe { &*self.header };
         let capacity = header.capacity as usize;
-        
+        let write_pos = header.write_pos.load(Ordering::Acquire) as usize;
+        let read_pos = header.read_pos.load(Ordering::Acquire) as usize;
+
+        if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            capacity - read_pos + write_pos
+        }
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        let _guard = self.read_lock.lock().unwrap();
+
+        let header = unsafe { &*self.header };
+        let capacity = header.capacity as usize;
+
         let write_pos = header.write_pos.load(Ordering::Acquire) as usize;
         let read_pos = header.read_pos.load(Ordering::Acquire) as usize;
 

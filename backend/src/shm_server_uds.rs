@@ -104,7 +104,10 @@ impl ShmServerUds {
                     let start = std::time::Instant::now();
                     
                     if delay_clone > Duration::ZERO {
-                        tokio::time::sleep(delay_clone).await;
+                        let start = std::time::Instant::now();
+                        while start.elapsed() < delay_clone {
+                            std::hint::spin_loop();
+                        }
                     }
                     
                     let processing_time = start.elapsed();

@@ -4,7 +4,7 @@
 
 set -e
 
-DELAY_US=1000
+DELAY_US=300
 SHM_NAME="backend"
 GATEWAY_PORT=8080
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")

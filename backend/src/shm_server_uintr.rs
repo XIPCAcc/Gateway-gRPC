@@ -25,6 +25,8 @@ static mut SERVER_UINTRFD: RawFd = -1;
 static mut SERVER_UIPI_INDEX: libc::c_int = -1;
 static mut GLOBAL_REQUEST_COUNTER: u64 = 0;
 static mut GLOBAL_RESPONSE_COUNTER: u64 = 0;
+static mut PACKET_COUNTER: u64 = 0;
+static mut LAST_NOTIFY_TIME: Option<std::time::Instant> = None;
 
 fn get_server_uintrfd() -> RawFd {
     unsafe { SERVER_UINTRFD }
@@ -43,6 +45,23 @@ fn get_server_uipi_index() -> libc::c_int {
 fn set_server_uipi_index(index: libc::c_int) {
     unsafe {
         SERVER_UIPI_INDEX = index;
+    }
+}
+
+fn get_packet_counter() -> u64 {
+    unsafe { PACKET_COUNTER }
+}
+
+fn set_packet_counter(counter: u64) {
+    unsafe {
+        PACKET_COUNTER = counter;
+    }
+}
+
+fn increment_packet_counter() -> u64 {
+    unsafe {
+        PACKET_COUNTER += 1;
+        PACKET_COUNTER
     }
 }
 
@@ -188,9 +207,12 @@ impl ShmServerUintr {
                             let start = std::time::Instant::now();
                             
                             if delay_clone > Duration::ZERO {
-                                tokio::time::sleep(delay_clone).await;
+                                let start = std::time::Instant::now();
+                                while start.elapsed() < delay_clone {
+                                    std::hint::spin_loop();
+                                }
                             }
-                            
+
                             let processing_time = start.elapsed();
                             
                             let response = EchoResponse {
@@ -216,13 +238,45 @@ impl ShmServerUintr {
                                 }
                             };
                             
+                            let was_empty = response_buffer_clone.is_empty();
+                            
                             if let Err(e) = response_buffer_clone.write(&payload) {
                                 warn!("Failed to write response: {}", e);
                                 return;
                             }
                             
-                            if let Err(e) = Self::send_uintr_notification() {
-                                warn!("Failed to send UINTR notification: {}", e);
+                            let packet_count = increment_packet_counter();
+
+                            // 自适应中断策略（与gateway端保持一致）
+                            let buffer_data_len = response_buffer_clone.available_data();
+                            let now = std::time::Instant::now();
+
+                            // 获取上一次通知时间
+                            let last_notify = unsafe { LAST_NOTIFY_TIME };
+                            let time_since_last_notify = last_notify.map(|t| now.duration_since(t)).unwrap_or(std::time::Duration::from_secs(u64::MAX));
+
+                            // 触发条件（满足任一即可）：
+                            // 1. buffer为空（新批次开始）
+                            // 2. 距离上一次通知超过10ms（防止饥饿）
+                            // 3. 包数超过20个（保底）
+                            // 4. buffer中数据超过1MB（防止积压）
+                            let should_notify = was_empty 
+                                || time_since_last_notify >= std::time::Duration::from_millis(10)
+                                || packet_count >= 20
+                                || buffer_data_len >= 1024 * 1024;
+
+                            if should_notify {
+                                set_packet_counter(0);
+                                // 更新上一次通知时间
+                                unsafe {
+                                    LAST_NOTIFY_TIME = Some(now);
+                                }
+                            }
+
+                            if should_notify {
+                                if let Err(e) = Self::send_uintr_notification() {
+                                    warn!("Failed to send UINTR notification: {}", e);
+                                }
                             }
                         });
                     }

@@ -31,6 +31,8 @@ static mut CLIENT_UINTRFD: RawFd = -1;
 static mut CLIENT_UIPI_INDEX: libc::c_int = -1;
 static mut GLOBAL_REQUEST_COUNTER: u64 = 0;
 static mut GLOBAL_RESPONSE_COUNTER: u64 = 0;
+static mut PACKET_COUNTER: u64 = 0;
+static mut LAST_NOTIFY_TIME: Option<std::time::Instant> = None;
 
 fn get_client_uintrfd() -> RawFd {
     unsafe { CLIENT_UINTRFD }
@@ -49,6 +51,23 @@ fn get_client_uipi_index() -> libc::c_int {
 fn set_client_uipi_index(index: libc::c_int) {
     unsafe {
         CLIENT_UIPI_INDEX = index;
+    }
+}
+
+fn get_packet_counter() -> u64 {
+    unsafe { PACKET_COUNTER }
+}
+
+fn set_packet_counter(counter: u64) {
+    unsafe {
+        PACKET_COUNTER = counter;
+    }
+}
+
+fn increment_packet_counter() -> u64 {
+    unsafe {
+        PACKET_COUNTER += 1;
+        PACKET_COUNTER
     }
 }
 
@@ -252,30 +271,67 @@ impl Transport for ShmTransportUintr {
             pending.insert(request_id.clone(), tx);
             info!("call(): 已将请求 {} 添加到待处理列表", request_id);
         }
-        
+
         let request_with_id = (request_id.clone(), request);
         let payload = bincode::serialize(&request_with_id)
             .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
-        
+
+        let was_empty = self.request_buffer.is_empty();
+
         info!("call(): 准备写入 {} 字节到共享内存，请求 {}", payload.len(), request_id);
-        
+
         self.request_buffer.write(&payload)
             .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;
-        
+
         let global_req_id = unsafe {
             GLOBAL_REQUEST_COUNTER += 1;
             GLOBAL_REQUEST_COUNTER
         };
-        info!("call(): 已将请求 {} (全局编号: {}) 写入共享内存", request_id, global_req_id);
+        let packet_count = increment_packet_counter();
         
-        self.send_uintr_notification()?;
-        info!("call(): 已发送 UINTR 通知，请求 {}", request_id);
+        // 自适应中断策略
+        let buffer_data_len = self.request_buffer.available_data();
+        let now = std::time::Instant::now();
+
+        // 获取上一次通知时间
+        let last_notify = unsafe { LAST_NOTIFY_TIME };
+        let time_since_last_notify = last_notify.map(|t| now.duration_since(t)).unwrap_or(std::time::Duration::from_secs(u64::MAX));
+
+        // 触发条件（满足任一即可）：
+        // 1. buffer为空（新批次开始）
+        // 2. 距离上一次通知超过10ms（防止饥饿）
+        // 3. 包数超过20个（保底）
+        // 4. buffer中数据超过1MB（防止积压）
+        let should_notify = was_empty 
+            || time_since_last_notify >= std::time::Duration::from_millis(10)
+            || packet_count >= 20
+            || buffer_data_len >= 1024 * 1024;
+
+        if should_notify {
+            set_packet_counter(0);
+            // 更新上一次通知时间
+            unsafe {
+                LAST_NOTIFY_TIME = Some(now);
+            }
+        }
         
+        info!(
+            "call(): 已将请求 {} (全局编号: {}) 写入共享内存, was_empty={}, packet_count={}, buffer_len={}, time_since_notify={:?}", 
+            request_id, global_req_id, was_empty, packet_count, buffer_data_len, time_since_last_notify
+        );
+
+        if should_notify {
+            self.send_uintr_notification()?;
+            info!("call(): 已发送 UINTR 通知，请求 {}", request_id);
+        } else {
+            debug!("call(): 跳过 UINTR 通知，请求 {}", request_id);
+        }
+
         info!("call(): 等待响应，请求 {}", request_id);
-        
+
         let result = rx.await
             .map_err(|_| anyhow::anyhow!("Response channel closed for request {}", request_id))??;
-        
+
         info!("call(): 收到响应，请求 {}", request_id);
         Ok(result)
     }

@@ -370,9 +370,12 @@ async fn run_shm_server(
                     let start = Instant::now();
                     let recv_time = Instant::now();
 
-                    // Simulate fixed processing delay
+                    // Simulate fixed processing delay using spin loop
                     if delay > Duration::ZERO {
-                        tokio::time::sleep(delay).await;
+                        let start = Instant::now();
+                        while start.elapsed() < delay {
+                            std::hint::spin_loop();
+                        }
                     }
 
                     let processing_time = start.elapsed();
