@@ -59,21 +59,21 @@ run_test() {
     sleep 1
 }
 
-for concurrency in 16 32 64 256 1024 4096; do
+for concurrency in 16 32 64 256 1024 4096 8192; do
     run_test "shm-uds" \
         "./target/release/backend --transport shm-uds --shm-name $SHM_NAME --delay-us $DELAY_US" \
         "./target/release/gateway --transport shm-uds --shm-name $SHM_NAME --listen-addr 127.0.0.1:$GATEWAY_PORT" \
         $concurrency
 done
 
-for concurrency in 16 32 64 256 1024 4096; do
+for concurrency in 16 32 64 256 1024 4096 8192; do
     run_test "shm-eventfd" \
         "./target/release/backend --transport shm-eventfd --shm-name $SHM_NAME --delay-us $DELAY_US" \
         "./target/release/gateway --transport shm-eventfd --shm-name $SHM_NAME --listen-addr 127.0.0.1:$GATEWAY_PORT" \
         $concurrency
 done
 
-for concurrency in 16 32 64 256 1024 4096; do
+for concurrency in 16 32 64 256 1024 4096 8192; do
     run_test "shm-uintr" \
         "./target/release/backend --transport shm-uintr --shm-name $SHM_NAME --delay-us $DELAY_US" \
         "./target/release/gateway --transport shm-uintr --shm-name $SHM_NAME --listen-addr 127.0.0.1:$GATEWAY_PORT" \

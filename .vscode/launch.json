@@ -1,0 +1,75 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug backend (shm-uintr)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/backend",
+            "args": [
+                "--transport", "shm-uintr",
+                "--shm-name", "gateway_shm_uintr_test_manual",
+            ],
+            "env": {
+                // "RUST_LOG": "info"
+                "RUST_LOG": "debug"
+            },
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "clean-shm-uintr"
+        },
+        {
+            "name": "Debug gateway (shm-uintr)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/gateway",
+            "args": [
+                "--transport", "shm-uintr",
+                "--shm-name", "gateway_shm_uintr_test_manual",
+            ],
+            "env": {
+                // "RUST_LOG": "info"
+                "RUST_LOG": "debug"
+            },
+            "cwd": "${workspaceFolder}",
+            // "preLaunchTask": "cargo build"
+        },
+        {
+            "name": "Debug backend (cargo run)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=backend",
+                    "--package=backend"
+                ]
+            },
+            "args": [
+                "--transport", "shm-uintr",
+                "--shm-name", "gateway_shm_uintr_test_manual"
+            ],
+            "env": {
+                "RUST_LOG": "info"
+            }
+        },
+        {
+            "name": "Debug gateway (cargo run)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=gateway",
+                    "--package=gateway"
+                ]
+            },
+            "args": [
+                "--transport", "shm-uintr",
+                "--shm-name", "gateway_shm_uintr_test_manual"
+            ],
+            "env": {
+                "RUST_LOG": "info"
+            }
+        },
+    ]
+}

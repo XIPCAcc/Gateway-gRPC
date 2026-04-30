@@ -319,13 +319,13 @@ impl Transport for ShmTransportUintr {
             "call(): 已将请求 {} (全局编号: {}) 写入共享内存, was_empty={}, packet_count={}, buffer_len={}, time_since_notify={:?}", 
             request_id, global_req_id, was_empty, packet_count, buffer_data_len, time_since_last_notify
         );
-
-        if should_notify {
-            self.send_uintr_notification()?;
-            info!("call(): 已发送 UINTR 通知，请求 {}", request_id);
-        } else {
-            debug!("call(): 跳过 UINTR 通知，请求 {}", request_id);
-        }
+        self.send_uintr_notification()?;
+        // if should_notify {
+        //     self.send_uintr_notification()?;
+        //     info!("call(): 已发送 UINTR 通知，请求 {}", request_id);
+        // } else {
+        //     debug!("call(): 跳过 UINTR 通知，请求 {}", request_id);
+        // }
 
         info!("call(): 等待响应，请求 {}", request_id);
 

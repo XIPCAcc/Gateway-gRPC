@@ -273,11 +273,11 @@ impl ShmServerUintr {
                                 }
                             }
 
-                            if should_notify {
+                            // if should_notify {
                                 if let Err(e) = Self::send_uintr_notification() {
                                     warn!("Failed to send UINTR notification: {}", e);
                                 }
-                            }
+                            // }
                         });
                     }
                     

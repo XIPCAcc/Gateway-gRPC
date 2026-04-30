@@ -1,9 +1,9 @@
 [submodule "uintr"]
 	path = uintr
-	url = ./uintr
+	url = https://github.com/XIPCAcc/uintr.git
 [submodule "tokio"]
 	path = tokio
-	url = https://github.com/tokio-rs/tokio.git
+	url = https://github.com/XIPCAcc/tokio-newly.git
 [submodule "uintr-core"]
 	path = uintr-core
 	url = https://github.com/XIPCAcc/uintr-core.git
