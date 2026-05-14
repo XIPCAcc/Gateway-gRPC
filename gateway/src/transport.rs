@@ -5,13 +5,14 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
-use proto::{EchoRequest, EchoResponse};
+use proto::{EchoRequest, EchoResponse, MatrixMultiplyRequest, MatrixMultiplyResponse};
 use shared_memory::shm::SharedMemoryRingBuffer;
-use shared_memory::ShmConfig;
+use shared_memory::{ShmConfig, ShmRequest, ShmResponse, MatrixDataPool, flatten_matrix, f64_slice_as_bytes};
 use tonic::transport::{Channel, Endpoint, Uri};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
 pub use crate::shm_transport_uds::ShmTransportUds;
@@ -24,6 +25,7 @@ pub use crate::shm_transport_uintr::ShmTransportUintr;
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn call(&self, request: EchoRequest) -> Result<EchoResponse>;
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse>;
 }
 
 /// TCP transport using tonic gRPC
@@ -51,6 +53,12 @@ impl Transport for TcpTransport {
     async fn call(&self, request: EchoRequest) -> Result<EchoResponse> {
         let mut client = self.client.clone();
         let response: tonic::Response<EchoResponse> = client.echo(tonic::Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
+
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse> {
+        let mut client = self.client.clone();
+        let response: tonic::Response<MatrixMultiplyResponse> = client.matrix_multiply(tonic::Request::new(request)).await?;
         Ok(response.into_inner())
     }
 }
@@ -94,6 +102,12 @@ impl Transport for UdsTransport {
         let response: tonic::Response<EchoResponse> = client.echo(tonic::Request::new(request)).await?;
         Ok(response.into_inner())
     }
+
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse> {
+        let mut client = self.client.clone();
+        let response: tonic::Response<MatrixMultiplyResponse> = client.matrix_multiply(tonic::Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
 }
 
 /// Tokio-based Shared Memory transport using async polling
@@ -102,21 +116,25 @@ pub struct ShmTransport {
     name: String,
     request_buffer: Arc<TokioMutex<SharedMemoryRingBuffer>>,
     response_buffer: Arc<TokioMutex<SharedMemoryRingBuffer>>,
+    data_pool: Arc<MatrixDataPool>,
 }
 
 impl ShmTransport {
     pub async fn new(name: &str) -> Result<Self> {
         let config = ShmConfig::default();
         
-        // Wait for backend to create the shared memory
         let request_buffer = Self::wait_for_shm(&format!("{}_req_buf", name), config).await?;
         let response_buffer = Self::wait_for_shm(&format!("{}_resp_buf", name), config).await?;
+
+        let data_pool_name = format!("{}_matrix_data", name);
+        let data_pool = Self::wait_for_data_pool(&data_pool_name).await?;
 
         info!("Shared Memory transport initialized (name: {})", name);
         Ok(Self {
             name: name.to_string(),
             request_buffer: Arc::new(TokioMutex::new(request_buffer)),
             response_buffer: Arc::new(TokioMutex::new(response_buffer)),
+            data_pool: Arc::new(data_pool),
         })
     }
     
@@ -129,6 +147,22 @@ impl ShmTransport {
                     attempts += 1;
                     if attempts > 50 {
                         return Err(anyhow::anyhow!("Timeout waiting for shared memory: {}", name));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_data_pool(name: &str) -> Result<MatrixDataPool> {
+        let mut attempts = 0;
+        loop {
+            match MatrixDataPool::open(name) {
+                Ok(pool) => return Ok(pool),
+                Err(_) => {
+                    attempts += 1;
+                    if attempts > 50 {
+                        return Err(anyhow::anyhow!("Timeout waiting for data pool: {}", name));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -184,6 +218,79 @@ impl Transport for ShmTransport {
             }
         }
     }
+
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse> {
+        let request_id = Uuid::new_v4().to_string();
+
+        let a: Vec<Vec<f64>> = bincode::deserialize(&request.matrix_a)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize matrix_a: {}", e))?;
+        let b: Vec<Vec<f64>> = bincode::deserialize(&request.matrix_b)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize matrix_b: {}", e))?;
+
+        let flat_a = flatten_matrix(&a);
+        let flat_b = flatten_matrix(&b);
+        let bytes_a = f64_slice_as_bytes(&flat_a);
+        let bytes_b = f64_slice_as_bytes(&flat_b);
+        let total_len = bytes_a.len() + bytes_b.len();
+
+        let offset = self.data_pool.allocate(total_len)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate data pool: {}", e))?;
+
+        self.data_pool.write_data(offset, bytes_a);
+        self.data_pool.write_data(offset + bytes_a.len() as u64, bytes_b);
+
+        let shm_request = ShmRequest::MatrixMultiply {
+            id: request_id.clone(),
+            matrix_size: request.matrix_size,
+            data_offset: offset,
+            data_len: total_len as u32,
+        };
+        let payload = bincode::serialize(&shm_request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize ShmRequest: {}", e))?;
+
+        {
+            let buffer = self.request_buffer.lock().await;
+            buffer.write(&payload)
+                .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;
+        }
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        let mut response_buf = vec![0u8; 65536];
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(anyhow::anyhow!("Request {} timeout after {:?}", request_id, timeout));
+            }
+
+            let n = {
+                let buffer = self.response_buffer.lock().await;
+                match buffer.read(&mut response_buf) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_micros(50)).await;
+                        continue;
+                    }
+                }
+            };
+
+            let shm_response: ShmResponse = match bincode::deserialize(&response_buf[..n]) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            match shm_response {
+                ShmResponse::MatrixMultiply { id, response } => {
+                    if id == request_id {
+                        let result: MatrixMultiplyResponse = bincode::deserialize(&response)
+                            .map_err(|e| anyhow::anyhow!("Failed to deserialize MatrixMultiplyResponse: {}", e))?;
+                        return Ok(result);
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
 }
 
 /// Transport enum for type-erased usage
@@ -212,6 +319,20 @@ impl Transport for TransportEnum {
             TransportEnum::ShmEventfd(t) => t.call(request).await,
             #[cfg(target_os = "linux")]
             TransportEnum::ShmUintr(t) => t.call(request).await,
+        }
+    }
+
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse> {
+        match self {
+            TransportEnum::Tcp(t) => t.matrix_multiply(request).await,
+            TransportEnum::Uds(t) => t.matrix_multiply(request).await,
+            TransportEnum::Shm(t) => t.matrix_multiply(request).await,
+            #[cfg(target_os = "linux")]
+            TransportEnum::ShmUds(t) => t.matrix_multiply(request).await,
+            #[cfg(target_os = "linux")]
+            TransportEnum::ShmEventfd(t) => t.matrix_multiply(request).await,
+            #[cfg(target_os = "linux")]
+            TransportEnum::ShmUintr(t) => t.matrix_multiply(request).await,
         }
     }
 }

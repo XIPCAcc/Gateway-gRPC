@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use proto::{EchoRequest, EchoResponse};
+use proto::{EchoRequest, EchoResponse, MatrixMultiplyRequest, MatrixMultiplyResponse};
 use shared_memory::shm::SharedMemoryRingBuffer;
-use shared_memory::{ShmConfig, ShmError};
+use shared_memory::{ShmConfig, ShmError, ShmRequest, ShmResponse, MatrixDataPool, flatten_matrix, f64_slice_as_bytes};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
@@ -21,7 +21,12 @@ use uintr::connection::setup_client_connection;
 use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
 use uintr::async_wait::{init_token, get_token, uintr_wait};
 
-type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<Result<EchoResponse>>>>>;
+enum PendingRequest {
+    Echo(oneshot::Sender<Result<EchoResponse>>),
+    MatrixMultiply(oneshot::Sender<Result<MatrixMultiplyResponse>>),
+}
+
+type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
 
 unsafe extern "C" {
     pub fn ui_handler(ui_frame: *mut uintr::syscall::UintrFrame, vector: u64);
@@ -77,6 +82,7 @@ pub struct ShmTransportUintr {
     response_buffer: Arc<SharedMemoryRingBuffer>,
     pending_requests: PendingRequests,
     running: Arc<AtomicBool>,
+    data_pool: Arc<MatrixDataPool>,
 }
 
 impl ShmTransportUintr {
@@ -141,7 +147,7 @@ impl ShmTransportUintr {
                     };
                     debug!("Response listener: 读取到 {} 字节的数据，响应全局编号: {}", n, global_resp_id);
                     
-                    let (request_id, response): (String, EchoResponse) = 
+                    let shm_response: ShmResponse = 
                         match bincode::deserialize(&response_buf[..n]) {
                             Ok(data) => data,
                             Err(e) => {
@@ -150,14 +156,40 @@ impl ShmTransportUintr {
                             }
                         };
                     
-                    debug!("Response listener: 收到请求 {} 的响应", request_id);
-                    
                     let mut pending = pending_requests_clone2.lock().await;
-                    if let Some(tx) = pending.remove(&request_id) {
-                        let _ = tx.send(Ok(response));
-                        debug!("Response listener: 已将响应发送给等待的请求 {}", request_id);
-                    } else {
-                        warn!("No pending request for ID: {}", request_id);
+                    match shm_response {
+                        ShmResponse::Echo { id: request_id, response: response_bytes } => {
+                            let response: EchoResponse = match bincode::deserialize(&response_bytes) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    warn!("Failed to deserialize EchoResponse: {}", e);
+                                    continue;
+                                }
+                            };
+                            debug!("Response listener: 收到请求 {} 的 Echo 响应", request_id);
+                            if let Some(PendingRequest::Echo(tx)) = pending.remove(&request_id) {
+                                let _ = tx.send(Ok(response));
+                                debug!("Response listener: 已将响应发送给等待的请求 {}", request_id);
+                            } else {
+                                warn!("No pending Echo request for ID: {}", request_id);
+                            }
+                        }
+                        ShmResponse::MatrixMultiply { id: request_id, response: response_bytes } => {
+                            let response: MatrixMultiplyResponse = match bincode::deserialize(&response_bytes) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    warn!("Failed to deserialize MatrixMultiplyResponse: {}", e);
+                                    continue;
+                                }
+                            };
+                            debug!("Response listener: 收到请求 {} 的 MatrixMultiply 响应", request_id);
+                            if let Some(PendingRequest::MatrixMultiply(tx)) = pending.remove(&request_id) {
+                                let _ = tx.send(Ok(response));
+                                debug!("Response listener: 已将响应发送给等待的请求 {}", request_id);
+                            } else {
+                                warn!("No pending MatrixMultiply request for ID: {}", request_id);
+                            }
+                        }
                     }
                 }
                 
@@ -174,12 +206,16 @@ impl ShmTransportUintr {
             name, uipi_index
         );
         
+        let data_pool_name = format!("{}_matrix_data", name);
+        let data_pool = Self::wait_for_data_pool(&data_pool_name).await?;
+        
         Ok(Self {
             name: name.to_string(),
             request_buffer,
             response_buffer,
             pending_requests,
             running,
+            data_pool: Arc::new(data_pool),
         })
     }
 
@@ -250,6 +286,22 @@ impl ShmTransportUintr {
             }
         }
     }
+
+    async fn wait_for_data_pool(name: &str) -> Result<MatrixDataPool> {
+        let mut attempts = 0;
+        loop {
+            match MatrixDataPool::open(name) {
+                Ok(pool) => return Ok(pool),
+                Err(_) => {
+                    attempts += 1;
+                    if attempts > 50 {
+                        return Err(anyhow::anyhow!("Timeout waiting for data pool: {}", name));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
 }
 
 impl Drop for ShmTransportUintr {
@@ -268,13 +320,18 @@ impl Transport for ShmTransportUintr {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending_requests.lock().await;
-            pending.insert(request_id.clone(), tx);
+            pending.insert(request_id.clone(), PendingRequest::Echo(tx));
             info!("call(): 已将请求 {} 添加到待处理列表", request_id);
         }
 
-        let request_with_id = (request_id.clone(), request);
-        let payload = bincode::serialize(&request_with_id)
+        let request_bytes = bincode::serialize(&request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
+        let shm_request = ShmRequest::Echo {
+            id: request_id.clone(),
+            request: request_bytes,
+        };
+        let payload = bincode::serialize(&shm_request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize ShmRequest: {}", e))?;
 
         let was_empty = self.request_buffer.is_empty();
 
@@ -289,19 +346,12 @@ impl Transport for ShmTransportUintr {
         };
         let packet_count = increment_packet_counter();
         
-        // 自适应中断策略
         let buffer_data_len = self.request_buffer.available_data();
         let now = std::time::Instant::now();
 
-        // 获取上一次通知时间
         let last_notify = unsafe { LAST_NOTIFY_TIME };
         let time_since_last_notify = last_notify.map(|t| now.duration_since(t)).unwrap_or(std::time::Duration::from_secs(u64::MAX));
 
-        // 触发条件（满足任一即可）：
-        // 1. buffer为空（新批次开始）
-        // 2. 距离上一次通知超过10ms（防止饥饿）
-        // 3. 包数超过20个（保底）
-        // 4. buffer中数据超过1MB（防止积压）
         let should_notify = was_empty 
             || time_since_last_notify >= std::time::Duration::from_millis(10)
             || packet_count >= 20
@@ -309,7 +359,6 @@ impl Transport for ShmTransportUintr {
 
         if should_notify {
             set_packet_counter(0);
-            // 更新上一次通知时间
             unsafe {
                 LAST_NOTIFY_TIME = Some(now);
             }
@@ -320,12 +369,6 @@ impl Transport for ShmTransportUintr {
             request_id, global_req_id, was_empty, packet_count, buffer_data_len, time_since_last_notify
         );
         self.send_uintr_notification()?;
-        // if should_notify {
-        //     self.send_uintr_notification()?;
-        //     info!("call(): 已发送 UINTR 通知，请求 {}", request_id);
-        // } else {
-        //     debug!("call(): 跳过 UINTR 通知，请求 {}", request_id);
-        // }
 
         info!("call(): 等待响应，请求 {}", request_id);
 
@@ -333,6 +376,53 @@ impl Transport for ShmTransportUintr {
             .map_err(|_| anyhow::anyhow!("Response channel closed for request {}", request_id))??;
 
         info!("call(): 收到响应，请求 {}", request_id);
+        Ok(result)
+    }
+
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse> {
+        let request_id = Uuid::new_v4().to_string();
+        info!("matrix_multiply(): 开始处理请求 {}", request_id);
+        
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(request_id.clone(), PendingRequest::MatrixMultiply(tx));
+        }
+
+        let a: Vec<Vec<f64>> = bincode::deserialize(&request.matrix_a)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize matrix_a: {}", e))?;
+        let b: Vec<Vec<f64>> = bincode::deserialize(&request.matrix_b)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize matrix_b: {}", e))?;
+        
+        let flat_a = flatten_matrix(&a);
+        let flat_b = flatten_matrix(&b);
+        let bytes_a = f64_slice_as_bytes(&flat_a);
+        let bytes_b = f64_slice_as_bytes(&flat_b);
+        let total_len = bytes_a.len() + bytes_b.len();
+        
+        let offset = self.data_pool.allocate(total_len)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate data pool: {}", e))?;
+        
+        self.data_pool.write_data(offset, bytes_a);
+        self.data_pool.write_data(offset + bytes_a.len() as u64, bytes_b);
+
+        let shm_request = ShmRequest::MatrixMultiply {
+            id: request_id.clone(),
+            matrix_size: request.matrix_size,
+            data_offset: offset,
+            data_len: total_len as u32,
+        };
+        let payload = bincode::serialize(&shm_request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize ShmRequest: {}", e))?;
+
+        self.request_buffer.write(&payload)
+            .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;
+
+        self.send_uintr_notification()?;
+
+        let result = rx.await
+            .map_err(|_| anyhow::anyhow!("Response channel closed for request {}", request_id))??;
+
         Ok(result)
     }
 }

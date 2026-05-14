@@ -5,6 +5,7 @@ package echo;
 service EchoService {
   rpc Echo(EchoRequest) returns (EchoResponse);
   rpc Compute(ComputeRequest) returns (ComputeResponse);
+  rpc MatrixMultiply(MatrixMultiplyRequest) returns (MatrixMultiplyResponse);
   rpc StreamEcho(stream EchoRequest) returns (stream EchoResponse);
 }
 
@@ -31,4 +32,18 @@ message ComputeResponse {
   double result = 1;
   int64 timestamp_ns = 2;
   int64 processing_time_us = 3;
+}
+
+message MatrixMultiplyRequest {
+  int32 matrix_size = 1;
+  bytes matrix_a = 2;
+  bytes matrix_b = 3;
+  int64 timestamp_ns = 4;
+}
+
+message MatrixMultiplyResponse {
+  double checksum = 1;
+  int64 timestamp_ns = 2;
+  int64 processing_time_us = 3;
+  double gflops = 4;
 }

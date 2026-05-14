@@ -36,7 +36,7 @@ echo ""
 echo "Cleaning up existing processes and shared memory..."
 pkill -9 backend 2>/dev/null || true
 pkill -9 gateway 2>/dev/null || true
-rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
+rm -f /tmp/shm/${SHM_NAME}_* 2>/dev/null || true
 sleep 2
 
 # Build binaries
@@ -113,7 +113,7 @@ echo "Cleaning up..."
 echo "=========================================="
 kill $GATEWAY_PID 2>/dev/null || true
 kill $BACKEND_PID 2>/dev/null || true
-rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
+rm -f /tmp/shm/${SHM_NAME}_* 2>/dev/null || true
 sleep 2
 
 echo ""

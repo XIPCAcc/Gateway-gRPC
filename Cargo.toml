@@ -61,3 +61,46 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[profile.release-ltoff]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 1
+
+[profile.release-o2]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+
+[profile.release-o3-nolto]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+
+[profile.release-lto-only]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+
+[profile.release-cgu1-only]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 1
+
+[profile.release-unwind]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[profile.release-o2-full]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 1

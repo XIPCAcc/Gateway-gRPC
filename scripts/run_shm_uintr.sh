@@ -19,6 +19,14 @@ pkill -9 backend 2>/dev/null || true
 pkill -9 gateway 2>/dev/null || true
 sleep 2
 
+# 修复：统一的共享内存清理函数
+cleanup_shm() {
+    local name=$1
+    # 正确的共享内存路径是 /dev/shm/（而不是 /tmp/shm/）
+    rm -f /dev/shm/${name}_req_buf /dev/shm/${name}_resp_buf /dev/shm/${name}_matrix_data 2>/dev/null || true
+    rm -f /tmp/${name}_*.sock 2>/dev/null || true
+}
+
 run_test() {
     local name=$1
     local backend_cmd=$2
@@ -31,8 +39,8 @@ run_test() {
     echo "=========================================="
     echo ""
 
-    rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
-    rm -f /tmp/${SHM_NAME}_*.sock 2>/dev/null || true
+    # 修复：使用正确的清理路径
+    cleanup_shm "$SHM_NAME"
 
     $backend_cmd &
     BACKEND_PID=$!
@@ -50,9 +58,11 @@ run_test() {
         "http://127.0.0.1:$GATEWAY_PORT/api/echo" 2>&1 | tee $LOG_DIR/${name}_test_${concurrency}.log
 
     kill $GATEWAY_PID $BACKEND_PID 2>/dev/null || true
+    # 修复：添加 wait 确保进程完全退出
+    wait $GATEWAY_PID $BACKEND_PID 2>/dev/null || true
     sleep 2
-    rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
-    rm -f /tmp/${SHM_NAME}_*.sock 2>/dev/null || true
+    # 修复：测试结束后再次清理
+    cleanup_shm "$SHM_NAME"
     sleep 1
 }
 

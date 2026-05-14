@@ -40,7 +40,7 @@ pkill -9 gateway 2>/dev/null || true
 sleep 2
 
 # Clean up shared memory and sockets
-rm -f /dev/shm/backend_* 2>/dev/null || true
+rm -f /tmp/shm/backend_* 2>/dev/null || true
 rm -f /tmp/backend*.sock 2>/dev/null || true
 
 echo "Building release binaries..."
@@ -111,7 +111,7 @@ run_test() {
     echo "Cleaning up..."
     kill $GATEWAY_PID 2>/dev/null || true
     kill $BACKEND_PID 2>/dev/null || true
-    rm -f /dev/shm/backend_* 2>/dev/null || true
+    rm -f /tmp/shm/backend_* 2>/dev/null || true
     rm -f /tmp/backend*.sock 2>/dev/null || true
     sleep 2
 }
