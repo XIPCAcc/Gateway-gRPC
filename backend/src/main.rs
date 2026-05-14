@@ -6,7 +6,8 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use prometheus::{register_counter, register_histogram, Counter, Histogram};
 use proto::echo_service_server::{EchoService as EchoServiceTrait, EchoServiceServer};
-use proto::{ComputeRequest, ComputeResponse, EchoRequest, EchoResponse};
+use proto::{ComputeRequest, ComputeResponse, EchoRequest, EchoResponse, MatrixMultiplyRequest, MatrixMultiplyResponse};
+use shared_memory::{multiply_matrices, calculate_checksum, ShmRequest, ShmResponse, MatrixDataPool, bytes_as_f64_slice, reconstruct_matrix};
 use tonic::{transport::Server, Request, Response, Status};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
@@ -155,6 +156,41 @@ impl EchoServiceTrait for EchoServiceImpl {
         Ok(Response::new(response))
     }
 
+    async fn matrix_multiply(
+        &self,
+        request: Request<MatrixMultiplyRequest>,
+    ) -> Result<Response<MatrixMultiplyResponse>, Status> {
+        REQUEST_COUNTER.inc();
+        let start = Instant::now();
+
+        let req = request.into_inner();
+        let size = req.matrix_size as usize;
+
+        let a: Vec<Vec<f64>> = bincode::deserialize(&req.matrix_a)
+            .map_err(|e| Status::invalid_argument(format!("Failed to deserialize matrix_a: {}", e)))?;
+        let b: Vec<Vec<f64>> = bincode::deserialize(&req.matrix_b)
+            .map_err(|e| Status::invalid_argument(format!("Failed to deserialize matrix_b: {}", e)))?;
+
+        let mut result = vec![vec![0.0; size]; size];
+        multiply_matrices(&a, &b, &mut result);
+        let checksum = calculate_checksum(&result);
+
+        let processing_time = start.elapsed();
+
+        let total_ops = 2.0 * (size as f64).powi(3);
+        let gflops = total_ops / (processing_time.as_secs_f64() * 1e9);
+
+        let response = MatrixMultiplyResponse {
+            checksum,
+            timestamp_ns: start.elapsed().as_nanos() as i64,
+            processing_time_us: processing_time.as_micros() as i64,
+            gflops,
+        };
+
+        REQUEST_DURATION.observe(start.elapsed().as_secs_f64());
+        Ok(Response::new(response))
+    }
+
     type StreamEchoStream =
         tonic::codegen::tokio_stream::wrappers::ReceiverStream<Result<EchoResponse, Status>>;
 
@@ -284,8 +320,12 @@ async fn async_main(args: Args) -> Result<()> {
 
             info!("Shared memory buffers created successfully");
 
-            // Run shared memory server loop
-            run_shm_server(request_buffer, response_buffer, delay).await?;
+            let data_pool_name = format!("{}_matrix_data", shm_name);
+            let data_pool_capacity = 256 * 1024 * 1024;
+            let data_pool = MatrixDataPool::create(&data_pool_name, data_pool_capacity)
+                .map_err(|e| anyhow::anyhow!("Failed to create matrix data pool: {}", e))?;
+
+            run_shm_server(request_buffer, response_buffer, data_pool, delay).await?;
         }
         #[cfg(target_os = "linux")]
         TransportType::ShmUds => {
@@ -355,6 +395,7 @@ async fn async_main(args: Args) -> Result<()> {
 async fn run_shm_server(
     request_buffer: SharedMemoryRingBuffer,
     response_buffer: SharedMemoryRingBuffer,
+    data_pool: MatrixDataPool,
     delay: Duration,
 ) -> Result<()> {
     info!("Shared memory server started, waiting for requests...");
@@ -362,15 +403,65 @@ async fn run_shm_server(
     let mut request_buf = vec![0u8; 65536];
     
     loop {
-        // Try to receive request
         match request_buffer.read(&mut request_buf) {
             Ok(n) => {
-                // Parse request
-                if let Ok(request) = serde_json::from_slice::<EchoRequest>(&request_buf[..n]) {
+                if let Ok(shm_request) = bincode::deserialize::<ShmRequest>(&request_buf[..n]) {
+                    match shm_request {
+                        ShmRequest::MatrixMultiply { id: request_id, matrix_size, data_offset, data_len } => {
+                            let data = data_pool.read_data(data_offset, data_len as usize).to_vec();
+
+                            let start = Instant::now();
+                            let size = matrix_size as usize;
+                            let per_matrix_len = size * size;
+                            let f64_data = bytes_as_f64_slice(&data);
+
+                            if f64_data.len() < per_matrix_len * 2 {
+                                warn!("Matrix data too short: expected {}, got {}", per_matrix_len * 2, f64_data.len());
+                                continue;
+                            }
+
+                            let a = reconstruct_matrix(&f64_data[..per_matrix_len], size);
+                            let b = reconstruct_matrix(&f64_data[per_matrix_len..], size);
+
+                            let mut result = vec![vec![0.0; size]; size];
+                            multiply_matrices(&a, &b, &mut result);
+                            let checksum = calculate_checksum(&result);
+
+                            let processing_time = start.elapsed();
+                            let total_ops = 2.0 * (size as f64).powi(3);
+                            let gflops = total_ops / (processing_time.as_secs_f64() * 1e9);
+
+                            let response = MatrixMultiplyResponse {
+                                checksum,
+                                timestamp_ns: processing_time.as_nanos() as i64,
+                                processing_time_us: processing_time.as_micros() as i64,
+                                gflops,
+                            };
+
+                            let response_bytes = bincode::serialize(&response).unwrap();
+                            let shm_response = ShmResponse::MatrixMultiply {
+                                id: request_id,
+                                response: response_bytes,
+                            };
+                            let payload = bincode::serialize(&shm_response)
+                                .map_err(|e| {
+                                    warn!("Failed to serialize response: {}", e);
+                                    return;
+                                })
+                                .unwrap();
+
+                            if let Err(e) = response_buffer.write(&payload) {
+                                warn!("Failed to write response: {}", e);
+                            }
+                        }
+                        _ => {
+                            warn!("Unknown ShmRequest variant");
+                        }
+                    }
+                } else if let Ok(request) = serde_json::from_slice::<EchoRequest>(&request_buf[..n]) {
                     let start = Instant::now();
                     let recv_time = Instant::now();
 
-                    // Simulate fixed processing delay using spin loop
                     if delay > Duration::ZERO {
                         let start = Instant::now();
                         while start.elapsed() < delay {
@@ -387,20 +478,14 @@ async fn run_shm_server(
                         payload: request.payload,
                     };
 
-                    // Serialize response
                     if let Ok(payload) = serde_json::to_vec(&response) {
-                        // Send response
                         if let Err(e) = response_buffer.write(&payload) {
                             warn!("Failed to write response: {}", e);
                         }
                     }
                 }
             }
-            Err(_) => {
-                // No data available, yield to Tokio runtime
-                // tokio::task::yield_now().await;
-                // tokio::time::sleep(Duration::from_micros(50)).await;
-            }
+            Err(_) => {}
         }
     }
 }

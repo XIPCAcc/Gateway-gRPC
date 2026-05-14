@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use nix::sys::eventfd::{eventfd, EfdFlags};
-use proto::{EchoRequest, EchoResponse};
+use proto::{EchoRequest, EchoResponse, MatrixMultiplyRequest, MatrixMultiplyResponse};
 use shared_memory::shm::SharedMemoryRingBuffer;
-use shared_memory::ShmConfig;
+use shared_memory::{ShmConfig, ShmRequest, ShmResponse, MatrixDataPool, flatten_matrix, f64_slice_as_bytes};
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
@@ -18,13 +18,21 @@ use uuid::Uuid;
 
 use crate::transport::Transport;
 
+enum PendingRequest {
+    Echo(oneshot::Sender<Result<EchoResponse>>),
+    MatrixMultiply(oneshot::Sender<Result<MatrixMultiplyResponse>>),
+}
+
+type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
+
 pub struct ShmTransportEventfd {
     name: String,
     request_buffer: Arc<SharedMemoryRingBuffer>,
     response_buffer: Arc<SharedMemoryRingBuffer>,
     request_event: Arc<AsyncFd<OwnedFd>>,
     response_event: Arc<AsyncFd<OwnedFd>>,
-    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EchoResponse>>>>>,
+    pending_requests: PendingRequests,
+    data_pool: Arc<MatrixDataPool>,
 }
 
 impl ShmTransportEventfd {
@@ -41,6 +49,9 @@ impl ShmTransportEventfd {
         let request_event = Self::recv_eventfd(&mut control_stream).await?;
         let response_event = Self::recv_eventfd(&mut control_stream).await?;
 
+        let data_pool_name = format!("{}_matrix_data", name);
+        let data_pool = Self::wait_for_data_pool(&data_pool_name).await?;
+
         info!(
             "Eventfd SHM transport initialized (name: {}, using eventfd)",
             name
@@ -53,6 +64,7 @@ impl ShmTransportEventfd {
             request_event: Arc::new(request_event),
             response_event: Arc::new(response_event),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            data_pool: Arc::new(data_pool),
         };
         
         transport.start_response_listener();
@@ -81,7 +93,7 @@ impl ShmTransportEventfd {
                                 break;
                             }
                             
-                            let (request_id, response): (String, EchoResponse) = 
+                            let shm_response: ShmResponse = 
                                 match bincode::deserialize(&response_buf[..n]) {
                                     Ok(data) => data,
                                     Err(e) => {
@@ -91,10 +103,35 @@ impl ShmTransportEventfd {
                                 };
                             
                             let mut pending = pending_requests.lock().await;
-                            if let Some(tx) = pending.remove(&request_id) {
-                                let _ = tx.send(Ok(response));
-                            } else {
-                                warn!("No pending request found for {}", request_id);
+                            match shm_response {
+                                ShmResponse::Echo { id: request_id, response: response_bytes } => {
+                                    let response: EchoResponse = match bincode::deserialize(&response_bytes) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            warn!("Failed to deserialize EchoResponse: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    if let Some(PendingRequest::Echo(tx)) = pending.remove(&request_id) {
+                                        let _ = tx.send(Ok(response));
+                                    } else {
+                                        warn!("No pending Echo request found for {}", request_id);
+                                    }
+                                }
+                                ShmResponse::MatrixMultiply { id: request_id, response: response_bytes } => {
+                                    let response: MatrixMultiplyResponse = match bincode::deserialize(&response_bytes) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            warn!("Failed to deserialize MatrixMultiplyResponse: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    if let Some(PendingRequest::MatrixMultiply(tx)) = pending.remove(&request_id) {
+                                        let _ = tx.send(Ok(response));
+                                    } else {
+                                        warn!("No pending MatrixMultiply request found for {}", request_id);
+                                    }
+                                }
                             }
                         }
                     }
@@ -115,6 +152,22 @@ impl ShmTransportEventfd {
                     attempts += 1;
                     if attempts > 50 {
                         return Err(anyhow::anyhow!("Timeout waiting for shared memory: {}", name));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_data_pool(name: &str) -> Result<MatrixDataPool> {
+        let mut attempts = 0;
+        loop {
+            match MatrixDataPool::open(name) {
+                Ok(pool) => return Ok(pool),
+                Err(_) => {
+                    attempts += 1;
+                    if attempts > 50 {
+                        return Err(anyhow::anyhow!("Timeout waiting for data pool: {}", name));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -210,12 +263,61 @@ impl Transport for ShmTransportEventfd {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending_requests.lock().await;
-            pending.insert(request_id.clone(), tx);
+            pending.insert(request_id.clone(), PendingRequest::Echo(tx));
         }
         
-        let request_with_id = (request_id.clone(), request);
-        let payload = bincode::serialize(&request_with_id)
+        let request_bytes = bincode::serialize(&request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
+        let shm_request = ShmRequest::Echo {
+            id: request_id.clone(),
+            request: request_bytes,
+        };
+        let payload = bincode::serialize(&shm_request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize ShmRequest: {}", e))?;
+        
+        self.request_buffer.write(&payload)
+            .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;
+        
+        Self::signal_eventfd(&self.request_event)?;
+        
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Response channel closed"))?
+    }
+
+    async fn matrix_multiply(&self, request: MatrixMultiplyRequest) -> Result<MatrixMultiplyResponse> {
+        let request_id = Uuid::new_v4().to_string();
+        
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(request_id.clone(), PendingRequest::MatrixMultiply(tx));
+        }
+        
+        let a: Vec<Vec<f64>> = bincode::deserialize(&request.matrix_a)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize matrix_a: {}", e))?;
+        let b: Vec<Vec<f64>> = bincode::deserialize(&request.matrix_b)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize matrix_b: {}", e))?;
+        
+        let flat_a = flatten_matrix(&a);
+        let flat_b = flatten_matrix(&b);
+        let bytes_a = f64_slice_as_bytes(&flat_a);
+        let bytes_b = f64_slice_as_bytes(&flat_b);
+        let total_len = bytes_a.len() + bytes_b.len();
+        
+        let offset = self.data_pool.allocate(total_len)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate data pool: {}", e))?;
+        
+        self.data_pool.write_data(offset, bytes_a);
+        self.data_pool.write_data(offset + bytes_a.len() as u64, bytes_b);
+        
+        let shm_request = ShmRequest::MatrixMultiply {
+            id: request_id.clone(),
+            matrix_size: request.matrix_size,
+            data_offset: offset,
+            data_len: total_len as u32,
+        };
+        let payload = bincode::serialize(&shm_request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize ShmRequest: {}", e))?;
         
         self.request_buffer.write(&payload)
             .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;

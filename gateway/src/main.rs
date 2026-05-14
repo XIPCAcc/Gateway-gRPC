@@ -13,7 +13,8 @@ use hyper_util::rt::TokioIo;
 use http_body_util::BodyExt;
 use prometheus::{register_counter, register_histogram, Counter, Histogram};
 
-use proto::{EchoRequest, EchoResponse};
+use proto::{EchoRequest, EchoResponse, MatrixMultiplyRequest, MatrixMultiplyResponse};
+use shared_memory::generate_matrix;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tonic::transport::{Channel, Endpoint, Uri};
 use tracing::{error, info, warn};
@@ -133,6 +134,70 @@ impl Gateway {
             }
         };
 
+        // Check if it's a matrix multiply request
+        if uri.path().contains("/matrix") {
+            let matrix_size = if body_bytes.is_empty() {
+                128
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    Ok(json) => json.get("matrix_size")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(128) as usize,
+                    Err(_) => 128,
+                }
+            };
+
+            let size = matrix_size as usize;
+            let a = generate_matrix(size);
+            let b = generate_matrix(size);
+
+            let matrix_a_bytes = bincode::serialize(&a)
+                .unwrap_or_default();
+            let matrix_b_bytes = bincode::serialize(&b)
+                .unwrap_or_default();
+
+            let matrix_req = MatrixMultiplyRequest {
+                matrix_size: size as i32,
+                matrix_a: matrix_a_bytes,
+                matrix_b: matrix_b_bytes,
+                timestamp_ns: start.elapsed().as_nanos() as i64,
+            };
+
+            // Forward to backend
+            let grpc_start = Instant::now();
+            GRPC_REQUESTS_TOTAL.inc();
+
+            let response = match self.transport.matrix_multiply(matrix_req).await {
+                Ok(resp) => {
+                    GRPC_REQUEST_DURATION.observe(grpc_start.elapsed().as_secs_f64());
+                    
+                    let json_resp = serde_json::json!({
+                        "checksum": resp.checksum,
+                        "processing_time_us": resp.processing_time_us,
+                        "timestamp_ns": resp.timestamp_ns,
+                        "gflops": resp.gflops,
+                    });
+
+                    Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .body(json_resp.to_string())
+                        .unwrap()
+                }
+                Err(e) => {
+                    error!("Backend call failed: {}", e);
+                    Response::builder()
+                        .status(503)
+                        .body(format!("Service Unavailable: {}", e))
+                        .unwrap()
+                }
+            };
+
+            HTTP_REQUEST_DURATION.observe(start.elapsed().as_secs_f64());
+            return Ok(response);
+        }
+
+        // Regular echo request
         // Parse request
         let echo_req = if body_bytes.is_empty() {
             EchoRequest {

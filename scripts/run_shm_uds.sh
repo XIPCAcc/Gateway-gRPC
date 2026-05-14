@@ -36,7 +36,7 @@ echo ""
 echo "Cleaning up existing processes, shared memory and sockets..."
 pkill -9 backend 2>/dev/null || true
 pkill -9 gateway 2>/dev/null || true
-rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
+rm -f /tmp/shm/${SHM_NAME}_* 2>/dev/null || true
 rm -f /tmp/${SHM_NAME}_*.sock 2>/dev/null || true
 sleep 2
 
@@ -114,7 +114,7 @@ echo "Cleaning up..."
 echo "=========================================="
 kill $GATEWAY_PID 2>/dev/null || true
 kill $BACKEND_PID 2>/dev/null || true
-rm -f /dev/shm/${SHM_NAME}_* 2>/dev/null || true
+rm -f /tmp/shm/${SHM_NAME}_* 2>/dev/null || true
 rm -f /tmp/${SHM_NAME}_*.sock 2>/dev/null || true
 sleep 2
 
