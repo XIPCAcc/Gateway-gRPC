@@ -7,15 +7,13 @@ use anyhow::Result;
 use proto::{EchoRequest, EchoResponse, MatrixMultiplyResponse};
 use shared_memory::shm::SharedMemoryRingBuffer;
 use shared_memory::{ShmConfig, ShmError, ShmRequest, ShmResponse, MatrixDataPool, multiply_matrices, calculate_checksum, bytes_as_f64_slice, reconstruct_matrix};
-use tokio::sync::Mutex;
 use tracing::{info, warn, debug};
 use nix::libc;
 
-use uintr::{UintrError, UintrResult};
 use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sender, senduipi, stui};
 use uintr::connection::setup_server_connection;
 use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
-use uintr::async_wait::{init_token, get_token, uintr_wait};
+use uintr::async_wait::{init_token, uintr_wait, process_global_uintr_wakers, get_notify_count, get_wake_count};
 
 unsafe extern "C" {
     pub fn ui_handler(ui_frame: *mut uintr::syscall::UintrFrame, vector: u64);
@@ -103,54 +101,112 @@ impl ShmServerUintr {
         })
     }
 
-    async fn setup_uintr(&self) -> Result<libc::c_int> {
-        init_token("server");
-        
-        let res = uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY)
-            .map_err(|e| anyhow::anyhow!("Failed to register UINTR handler: {}", e))?;
-        info!("UINTR server: Interrupt handler registered successfully: {}", res);
-
-        let server_descriptor = uintr_create_fd(0, 0)
-            .map_err(|e| anyhow::anyhow!("Failed to create uintrfd: {}", e))?;
-        set_server_uintrfd(server_descriptor);
-        info!(
-            "UINTR server: Created uintrfd with descriptor {} (vector 0)",
-            server_descriptor
-        );
-
-        unsafe {
-            stui();
-        }
-        info!("UINTR server: Interrupts enabled");
-
-        Ok(res)
-    }
-    
     pub async fn run(mut self, delay: Duration) -> Result<()> {
         info!("SHM server started, setting up UINTR...");
         
         let socket_path = format!("/tmp/{}_uintr.sock", self.name);
         let _ = std::fs::remove_file(&socket_path);
         
-        self.setup_uintr().await?;
-        
-        info!("Waiting for gateway connection...");
-        let client_fd = setup_server_connection(&socket_path, get_server_uintrfd()).await
-            .map_err(|e| anyhow::anyhow!("Failed to wait for client: {}", e))?;
-        info!("Gateway connected via UINTR");
-
-        let uipi_index = uintr_register_sender(client_fd, 0)
-            .map_err(|e| anyhow::anyhow!("Failed to register UINTR sender: {}", e))?;
-        set_server_uipi_index(uipi_index);
-        info!("UINTR server: Registered sender for client with UIPI index {}", uipi_index);
-
-        let token = get_token()
-            .map_err(|e| anyhow::anyhow!("Failed to get token: {}", e))?;
-
         let response_buffer = self.response_buffer.clone();
         let request_buffer = Arc::new(self.request_buffer);
         let running = self.running.clone();
         let mut request_buf = vec![0u8; 65536];
+        
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let running_clone = running.clone();
+        let socket_path_for_blocking = socket_path.clone();
+        
+        let uintr_handle = tokio::task::spawn_blocking(move || {
+            info!("UINTR blocking thread: initializing...");
+            
+            init_token("server");
+            
+            match uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY) {
+                Ok(res) => info!("UINTR blocking thread: handler registered: {}", res),
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to register handler: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            }
+            
+            let server_fd = match uintr_create_fd(0, 0) {
+                Ok(fd) => {
+                    set_server_uintrfd(fd);
+                    info!("UINTR blocking thread: created uintrfd {}", fd);
+                    fd
+                }
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to create uintrfd: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+
+            info!("UINTR blocking thread: waiting for gateway connection...");
+            let client_fd = match setup_server_connection(&socket_path_for_blocking, server_fd) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to wait for client: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            info!("UINTR blocking thread: gateway connected, client_fd={}", client_fd);
+
+            let uipi_index = match uintr_register_sender(client_fd, 0) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to register sender: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            set_server_uipi_index(uipi_index);
+            info!("UINTR blocking thread: sender registered, uipi_index={}", uipi_index);
+            
+            unsafe { stui(); }
+            info!("UINTR blocking thread: interrupts enabled");
+
+            let _ = done_tx.send(());
+            
+            info!("UINTR blocking thread: entering wait loop");
+            let mut last_notify = get_notify_count();
+            let mut last_wake = get_wake_count();
+            while running_clone.load(Ordering::SeqCst) {
+                match uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0) {
+                    Ok(true) => {
+                        let cur_notify = get_notify_count();
+                        debug!(
+                            "UINTR blocking wait: interrupt received (notify_cnt: {} -> {}, +{})",
+                            last_notify, cur_notify, cur_notify - last_notify
+                        );
+                        last_notify = cur_notify;
+                        let woken = process_global_uintr_wakers();
+                        let cur_wake = get_wake_count();
+                        info!(
+                            "UINTR: process_global_uintr_wakers returned {} (wake_cnt: {} -> {}, +{})",
+                            woken, last_wake, cur_wake, cur_wake - last_wake
+                        );
+                        last_wake = cur_wake;
+                    }
+                    Ok(false) => {
+                        debug!("UINTR blocking wait: timeout (no interrupt in window)");
+                    }
+                    Err(e) => {
+                        warn!("UINTR blocking wait error: {}, exiting", e);
+                        break;
+                    }
+                }
+                // loop {
+                    // notify_global_uintr().unwrap();
+                // }
+            }
+            info!("UINTR blocking thread: exited");
+        });
+        
+        done_rx.await
+            .map_err(|e| anyhow::anyhow!("UINTR blocking thread failed to initialize: {}", e))?;
         
         tokio::spawn(async move {
             info!("Request listener thread started");
@@ -324,6 +380,7 @@ impl ShmServerUintr {
                                 timestamp_ns: processing_time.as_nanos() as i64,
                                 processing_time_us: processing_time.as_micros() as i64,
                                 gflops,
+                                shm_roundtrip_us: 0,
                             };
                                     
                                     let response_bytes = bincode::serialize(&response).unwrap();
@@ -360,10 +417,12 @@ impl ShmServerUintr {
             
             info!("Request listener thread exited");
         });
-        
+
         tokio::signal::ctrl_c().await?;
         info!("Shutting down SHM server");
         self.running.store(false, Ordering::SeqCst);
+
+        let _ = uintr_handle.await;
         
         Ok(())
     }
@@ -374,7 +433,7 @@ impl ShmServerUintr {
             return Err(anyhow::anyhow!("UINTR not initialized"));
         }
 
-        debug!("Sending UINTR notification with UIPI index: {}", uipi_index);
+        info!(">>> send_uintr_notification: sending UIPI index={}", uipi_index);
         unsafe {
             senduipi(uipi_index as u64);
         }

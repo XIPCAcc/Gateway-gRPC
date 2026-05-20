@@ -12,7 +12,7 @@
             ],
             "env": {
                 // "RUST_LOG": "info"
-                "RUST_LOG": "debug"
+                // "RUST_LOG": "debug"
             },
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "clean-shm-uintr"
@@ -28,48 +28,44 @@
             ],
             "env": {
                 // "RUST_LOG": "info"
-                "RUST_LOG": "debug"
+                // "RUST_LOG": "debug"
             },
             "cwd": "${workspaceFolder}",
             // "preLaunchTask": "cargo build"
         },
+
+        // release
         {
-            "name": "Debug backend (cargo run)",
+            "name": "Release backend (shm-uintr)",
             "type": "lldb",
             "request": "launch",
-            "cargo": {
-                "args": [
-                    "run",
-                    "--bin=backend",
-                    "--package=backend"
-                ]
-            },
+            "program": "${workspaceFolder}/target/release/backend",
             "args": [
                 "--transport", "shm-uintr",
-                "--shm-name", "gateway_shm_uintr_test_manual"
+                "--shm-name", "gateway_shm_uintr_test_manual",
             ],
             "env": {
-                "RUST_LOG": "info"
-            }
+                // "RUST_LOG": "info"
+                // "RUST_LOG": "warn"
+            },
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "clean-shm-uintr-release"
         },
         {
-            "name": "Debug gateway (cargo run)",
+            "name": "Release gateway (shm-uintr)",
             "type": "lldb",
             "request": "launch",
-            "cargo": {
-                "args": [
-                    "run",
-                    "--bin=gateway",
-                    "--package=gateway"
-                ]
-            },
+            "program": "${workspaceFolder}/target/release/gateway",
             "args": [
                 "--transport", "shm-uintr",
-                "--shm-name", "gateway_shm_uintr_test_manual"
+                "--shm-name", "gateway_shm_uintr_test_manual",
             ],
             "env": {
-                "RUST_LOG": "info"
-            }
+                // "RUST_LOG": "info"
+                "RUST_LOG": "warn"
+            },
+            "cwd": "${workspaceFolder}",
+            // "preLaunchTask": "cargo build"
         },
     ]
 }

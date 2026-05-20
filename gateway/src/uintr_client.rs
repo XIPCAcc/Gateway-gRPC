@@ -87,7 +87,7 @@ impl UintrClient {
 
         // 连接到服务器的 Unix Domain Socket
         info!("UINTR client: Connecting to server at {}", self.socket_path);
-        let server_fd = setup_client_connection(&self.socket_path, get_client_uintrfd()).await?;
+        let server_fd = setup_client_connection(&self.socket_path, get_client_uintrfd())?;
         info!("UINTR client: Received server file descriptor {}", server_fd);
 
         // 注册发送者

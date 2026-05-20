@@ -167,20 +167,28 @@ impl MatrixDataPool {
 
         loop {
             let current = header.alloc_offset.load(Ordering::Acquire);
-            let mut new_offset = current as usize + size;
+            let next_offset = current as usize + size;
 
-            if new_offset >= capacity {
-                new_offset = size;
-            }
-
-            match header.alloc_offset.compare_exchange(
-                current,
-                new_offset as u64,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(current),
-                Err(_) => continue,
+            if next_offset > capacity {
+                match header.alloc_offset.compare_exchange(
+                    current,
+                    size as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(0),
+                    Err(_) => continue,
+                }
+            } else {
+                match header.alloc_offset.compare_exchange(
+                    current,
+                    next_offset as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(current),
+                    Err(_) => continue,
+                }
             }
         }
     }

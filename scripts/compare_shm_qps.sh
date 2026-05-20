@@ -1,17 +1,20 @@
 #!/bin/bash
 
-# 比较三种 SHM 传输方式在不同矩阵大小和并发度下的矩阵乘法性能
-# 目标：找出最有利于 uintr 的场景
+# 比较三种 SHM 传输方式的 QPS（纯吞吐量，不输出 SHM 延迟日志）
+# 日志输出对 QPS 影响很大，因此关闭 gateway 日志，只关注吞吐量
 
 set -e
 
 GATEWAY_PORT=8080
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-LOG_DIR="log/matrix_${TIMESTAMP}"
-TEST_DURATION=15
+LOG_DIR="log/matrix_qps_${TIMESTAMP}"
+TEST_DURATION=1
 
-MATRIX_SIZES=(2 4 8 16 32 64 128 256 512)
-CONCURRENCIES=(16 32 64 128 256 512 1024)
+# MATRIX_SIZES=(2 4 8 16 32 64 128)
+# CONCURRENCIES=(8 8 8 16 16 16 32 32 32 64 64 64 128 128 128 256 256 256)
+
+MATRIX_SIZES=(2 4 8)
+CONCURRENCIES=(8 8 16 16)
 
 mkdir -p $LOG_DIR
 
@@ -35,11 +38,12 @@ run_matrix_test() {
     local gateway_transport=$3
     local matrix_size=$4
     local concurrency=$5
-    local shm_name="bench_${transport_name}_m${matrix_size}_c${concurrency}"
+    local run_label=${6:-}
+    local shm_name="qps_${transport_name}_m${matrix_size}_c${concurrency}${run_label:+_}$run_label"
 
     echo ""
     echo "=========================================="
-    echo "Testing ${transport_name} | Matrix: ${matrix_size}x${matrix_size} | Concurrency: ${concurrency}"
+    echo "${transport_name} | Matrix: ${matrix_size}x${matrix_size} | Concurrency: ${concurrency}${run_label:+ ($run_label)}"
     echo "=========================================="
 
     cleanup_shm "$shm_name"
@@ -49,19 +53,22 @@ run_matrix_test() {
         --shm-name ${shm_name} \
         --delay-us 0 &
     BACKEND_PID=$!
-    sleep 3
+
+    sleep 2
 
     if ! kill -0 $BACKEND_PID 2>/dev/null; then
         echo "ERROR: Backend failed to start!"
         return 1
     fi
 
+    echo "Starting gateway (no latency logging)..."
     ./target/release/gateway \
         --transport ${gateway_transport} \
         --shm-name ${shm_name} \
         --listen-addr 127.0.0.1:${GATEWAY_PORT} &
     GATEWAY_PID=$!
-    sleep 2
+
+    sleep 3
 
     if ! kill -0 $GATEWAY_PID 2>/dev/null; then
         echo "ERROR: Gateway failed to start!"
@@ -69,10 +76,11 @@ run_matrix_test() {
         return 1
     fi
 
-    local log_file="${LOG_DIR}/${transport_name}_m${matrix_size}_c${concurrency}.log"
+    local file_suffix="${run_label:+_}${run_label}"
+    local log_file="${LOG_DIR}/${transport_name}_m${matrix_size}_c${concurrency}${file_suffix}.log"
 
     echo "Running wrk (matrix ${matrix_size}x${matrix_size}, ${concurrency} connections)..."
-    MATRIX_SIZE=${matrix_size} wrk -t8 -c${concurrency} -d${TEST_DURATION}s --latency \
+    MATRIX_SIZE=${matrix_size} wrk -t8 -c${concurrency} -d${TEST_DURATION}s \
         -s scripts/wrk_matrix.lua \
         "http://127.0.0.1:${GATEWAY_PORT}/matrix" 2>&1 | tee ${log_file}
 
@@ -83,6 +91,8 @@ run_matrix_test() {
     sleep 1
 }
 
+declare -A run_count
+
 for matrix_size in "${MATRIX_SIZES[@]}"; do
     for concurrency in "${CONCURRENCIES[@]}"; do
         if [ $matrix_size -ge 256 ] && [ $concurrency -ge 512 ]; then
@@ -90,15 +100,20 @@ for matrix_size in "${MATRIX_SIZES[@]}"; do
             continue
         fi
 
-        run_matrix_test "shm-uds"     "shm-uds"     "shm-uds"     $matrix_size $concurrency || true
-        run_matrix_test "shm-eventfd" "shm-eventfd" "shm-eventfd" $matrix_size $concurrency || true
-        run_matrix_test "shm-uintr"   "shm-uintr"   "shm-uintr"   $matrix_size $concurrency || true
+        run_count_key="${matrix_size}_${concurrency}"
+        run_count[$run_count_key]=$(( ${run_count[$run_count_key]:-0} + 1 ))
+        run_label="r${run_count[$run_count_key]}"
+
+        run_matrix_test "shm-uintr"   "shm-uintr"   "shm-uintr"   $matrix_size $concurrency $run_label || true
+        run_matrix_test "shm-eventfd" "shm-eventfd" "shm-eventfd" $matrix_size $concurrency $run_label || true
+        run_matrix_test "shm-uds"     "shm-uds"     "shm-uds"     $matrix_size $concurrency $run_label || true
+        
     done
 done
 
 echo ""
 echo "=========================================="
-echo "All Matrix Multiplication Tests Complete!"
+echo "All QPS Tests Complete!"
 echo "=========================================="
 echo ""
 echo "Results saved to: ${LOG_DIR}/"
@@ -110,8 +125,8 @@ echo "=========================================="
 
 SUMMARY_FILE="${LOG_DIR}/summary.txt"
 
-echo "Matrix Multiplication Performance Comparison" > ${SUMMARY_FILE}
-echo "===========================================" >> ${SUMMARY_FILE}
+echo "QPS Performance Comparison (no latency logging)" > ${SUMMARY_FILE}
+echo "================================================" >> ${SUMMARY_FILE}
 echo "Date: $(date)" >> ${SUMMARY_FILE}
 echo "" >> ${SUMMARY_FILE}
 echo "Matrix Sizes: ${MATRIX_SIZES[*]}" >> ${SUMMARY_FILE}
@@ -119,26 +134,29 @@ echo "Concurrencies: ${CONCURRENCIES[*]}" >> ${SUMMARY_FILE}
 echo "Test Duration: ${TEST_DURATION}s each" >> ${SUMMARY_FILE}
 echo "" >> ${SUMMARY_FILE}
 
-printf "%-12s %-8s %-12s %-14s %-14s %-14s\n" "Transport" "Matrix" "Concurrency" "QPS(req/s)" "AvgLat(ms)" "P99Lat(ms)" >> ${SUMMARY_FILE}
-printf "%-12s %-8s %-12s %-14s %-14s %-14s\n" "---------" "------" "----------" "----------" "----------" "----------" >> ${SUMMARY_FILE}
+printf "%-12s %-8s %-12s %-6s %-14s %-14s\n" \
+    "Transport" "Matrix" "Concurrency" "Run" "QPS(req/s)" "AvgLat(ms)" >> ${SUMMARY_FILE}
+printf "%-12s %-8s %-12s %-6s %-14s %-14s\n" \
+    "---------" "------" "----------" "----" "----------" "----------" >> ${SUMMARY_FILE}
+
+UNIQUE_CONCURRENCIES=($(echo "${CONCURRENCIES[@]}" | tr ' ' '\n' | sort -nu))
 
 for transport in "shm-uds" "shm-eventfd" "shm-uintr"; do
     for matrix_size in "${MATRIX_SIZES[@]}"; do
-        for concurrency in "${CONCURRENCIES[@]}"; do
-            if [ $matrix_size -ge 256 ] && [ $concurrency -ge 512 ]; then
-                continue
-            fi
-            log_file="${LOG_DIR}/${transport}_m${matrix_size}_c${concurrency}.log"
-            if [ -f "$log_file" ]; then
+        for concurrency in "${UNIQUE_CONCURRENCIES[@]}"; do
+            for fname in "${LOG_DIR}/${transport}_m${matrix_size}_c${concurrency}"*.log; do
+                [ -f "$fname" ] || continue
+                log_file="$fname"
+                run_label=$(echo "$log_file" | sed -n 's/.*_r\([0-9]*\)\.log/\1/p')
+                run_label=${run_label:-1}
                 qps=$(grep "Requests/sec:" "$log_file" | awk '{print $2}')
                 avg_lat=$(grep "Latency" "$log_file" | head -1 | awk '{print $2}')
-                p99_lat=$(grep "99%" "$log_file" | head -1 | awk '{print $2}')
                 qps=${qps:-"N/A"}
                 avg_lat=${avg_lat:-"N/A"}
-                p99_lat=${p99_lat:-"N/A"}
-                printf "%-12s %-8s %-12s %-14s %-14s %-14s\n" \
-                    "$transport" "${matrix_size}x${matrix_size}" "$concurrency" "$qps" "$avg_lat" "$p99_lat" >> ${SUMMARY_FILE}
-            fi
+                printf "%-12s %-8s %-12s %-6s %-14s %-14s\n" \
+                    "$transport" "${matrix_size}x${matrix_size}" "$concurrency" "$run_label" \
+                    "$qps" "$avg_lat" >> ${SUMMARY_FILE}
+            done
         done
     done
     echo "" >> ${SUMMARY_FILE}

@@ -93,7 +93,7 @@ impl UintrServer {
 
         // 等待客户端连接
         info!("UINTR server: Waiting for client connection...");
-        let client_fd = setup_server_connection(&self.socket_path, get_server_uintrfd()).await?;
+        let client_fd = setup_server_connection(&self.socket_path, get_server_uintrfd())?;
         info!("UINTR server: Received client file descriptor {}", client_fd);
 
         // 注册发送者

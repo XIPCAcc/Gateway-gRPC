@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,13 +13,16 @@ use tracing::{info, warn, error, debug};
 use uuid::Uuid;
 use nix::libc;
 
+// 日志采样计数器和采样间隔
+static LATENCY_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const LATENCY_LOG_INTERVAL: usize = 10;
+
 use crate::transport::Transport;
 
-use uintr::{UintrError, UintrResult};
 use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sender, senduipi, stui};
 use uintr::connection::setup_client_connection;
 use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
-use uintr::async_wait::{init_token, get_token, uintr_wait};
+use uintr::async_wait::{init_token, get_token, uintr_wait, process_global_uintr_wakers, get_notify_count, get_wake_count};
 
 enum PendingRequest {
     Echo(oneshot::Sender<Result<EchoResponse>>),
@@ -83,38 +86,125 @@ pub struct ShmTransportUintr {
     pending_requests: PendingRequests,
     running: Arc<AtomicBool>,
     data_pool: Arc<MatrixDataPool>,
+    _uintr_handle: tokio::task::JoinHandle<()>,
 }
 
 impl ShmTransportUintr {
     pub async fn new(name: &str) -> Result<Self> {
         let config = ShmConfig::default();
-        
+
         let request_buffer = Arc::new(Self::wait_for_shm(&format!("{}_req_buf", name), config).await?);
         let response_buffer = Arc::new(Self::wait_for_shm(&format!("{}_resp_buf", name), config).await?);
 
         let socket_path = format!("/tmp/{}_uintr.sock", name);
-        
+
         let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
         let pending_requests_clone = pending_requests.clone();
         let response_buffer_clone = response_buffer.clone();
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let running_clone2 = running.clone();
 
-        let uipi_index = Self::setup_uintr(&socket_path).await?;
+        let (done_tx, done_rx) = oneshot::channel();
 
-        let token = get_token()
+        let uintr_handle = tokio::task::spawn_blocking(move || {
+            init_token("client");
+
+            match uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY) {
+                Ok(res) => info!("UINTR blocking thread: handler registered: {}", res),
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to register handler: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            }
+
+            let client_fd = match uintr_create_fd(0, 0) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to create uintrfd: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            set_client_uintrfd(client_fd);
+            info!("UINTR blocking thread: uintrfd created: {}", client_fd);
+
+            let server_fd = match setup_client_connection(&socket_path, client_fd) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to connect to server: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            info!("UINTR blocking thread: connected to server, server_fd={}", server_fd);
+
+            let uipi_index = match uintr_register_sender(server_fd, 0) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!("UINTR blocking thread: failed to register sender: {}", e);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            set_client_uipi_index(uipi_index);
+            info!("UINTR blocking thread: sender registered, uipi_index={}", uipi_index);
+
+            unsafe { stui(); }
+            info!("UINTR blocking thread: interrupts enabled");
+
+            let _ = done_tx.send(());
+
+            let mut last_notify = get_notify_count();
+            let mut last_wake = get_wake_count();
+
+            while running_clone2.load(Ordering::SeqCst) {
+                match uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0) {
+                    Ok(true) => {
+                        let cur_notify = get_notify_count();
+                        debug!(
+                            "UINTR blocking wait: interrupt received (notify_cnt: {} -> {}, +{})",
+                            last_notify, cur_notify, cur_notify - last_notify
+                        );
+                        last_notify = cur_notify;
+                        let woken = process_global_uintr_wakers();
+                        let cur_wake = get_wake_count();
+                        info!(
+                            "UINTR: process_global_uintr_wakers returned {} (wake_cnt: {} -> {}, +{})",
+                            woken, last_wake, cur_wake, cur_wake - last_wake
+                        );
+                        last_wake = cur_wake;
+                    }
+                    Ok(false) => {
+                        debug!("UINTR blocking wait: timeout (no interrupt in window)");
+                    }
+                    Err(e) => {
+                        warn!("UINTR blocking wait error: {}, exiting", e);
+                        break;
+                    }
+                }
+            }
+            info!("UINTR blocking wait task exited");
+        });
+
+        done_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("UINTR blocking thread failed to initialize"))?;
+
+        let _token = get_token()
             .map_err(|e| anyhow::anyhow!("Failed to get token: {}", e))?;
 
         let pending_requests_clone2 = pending_requests_clone.clone();
         tokio::spawn(async move {
             let mut response_buf = vec![0u8; 131072];
-            
+
             info!("UINTR response listener thread started");
-            
+
             while running_clone.load(Ordering::SeqCst) {
                 debug!("Waiting for UINTR notification...");
                 info!("Response listener: 等待 UINTR 响应通知...");
-                
+
                 match Self::wait_for_uintr().await {
                     Ok(_) => {
                         debug!("Received UINTR notification");
@@ -125,7 +215,7 @@ impl ShmTransportUintr {
                         break;
                     }
                 }
-                
+
                 let mut processed = 0;
                 loop {
                     let n = match response_buffer_clone.read(&mut response_buf) {
@@ -139,15 +229,15 @@ impl ShmTransportUintr {
                             break;
                         }
                     };
-                    
+
                     processed += 1;
                     let global_resp_id = unsafe {
                         GLOBAL_RESPONSE_COUNTER += 1;
                         GLOBAL_RESPONSE_COUNTER
                     };
                     debug!("Response listener: 读取到 {} 字节的数据，响应全局编号: {}", n, global_resp_id);
-                    
-                    let shm_response: ShmResponse = 
+
+                    let shm_response: ShmResponse =
                         match bincode::deserialize(&response_buf[..n]) {
                             Ok(data) => data,
                             Err(e) => {
@@ -155,7 +245,7 @@ impl ShmTransportUintr {
                                 continue;
                             }
                         };
-                    
+
                     let mut pending = pending_requests_clone2.lock().await;
                     match shm_response {
                         ShmResponse::Echo { id: request_id, response: response_bytes } => {
@@ -192,23 +282,23 @@ impl ShmTransportUintr {
                         }
                     }
                 }
-                
+
                 if processed > 0 {
                     info!("Response listener: 处理了 {} 个响应", processed);
                 }
             }
-            
+
             error!("UINTR response listener thread exited!");
         });
 
         info!(
-            "SHM transport with UINTR notification initialized (name: {}, UIPI index: {})",
-            name, uipi_index
+            "SHM transport with UINTR notification initialized (name: {})",
+            name
         );
-        
+
         let data_pool_name = format!("{}_matrix_data", name);
         let data_pool = Self::wait_for_data_pool(&data_pool_name).await?;
-        
+
         Ok(Self {
             name: name.to_string(),
             request_buffer,
@@ -216,39 +306,8 @@ impl ShmTransportUintr {
             pending_requests,
             running,
             data_pool: Arc::new(data_pool),
+            _uintr_handle: uintr_handle,
         })
-    }
-
-    async fn setup_uintr(socket_path: &str) -> Result<libc::c_int> {
-        init_token("client");
-        
-        let res = uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY)
-            .map_err(|e| anyhow::anyhow!("Failed to register UINTR handler: {}", e))?;
-        info!("UINTR client: Interrupt handler registered successfully: {}", res);
-
-        let client_descriptor = uintr_create_fd(0, 0)
-            .map_err(|e| anyhow::anyhow!("Failed to create uintrfd: {}", e))?;
-        set_client_uintrfd(client_descriptor);
-        info!(
-            "UINTR client: Created uintrfd with descriptor {} (vector 0)",
-            client_descriptor
-        );
-
-        unsafe {
-            stui();
-        }
-        info!("UINTR client: Interrupts enabled");
-
-        let server_fd = setup_client_connection(socket_path, get_client_uintrfd()).await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to UINTR server: {}", e))?;
-        info!("UINTR client: Received server file descriptor {}", server_fd);
-
-        let uipi_index = uintr_register_sender(server_fd, 0)
-            .map_err(|e| anyhow::anyhow!("Failed to register UINTR sender: {}", e))?;
-        set_client_uipi_index(uipi_index);
-        info!("UINTR client: Registered sender for server with UIPI index {}", uipi_index);
-
-        Ok(uipi_index)
     }
 
     fn send_uintr_notification(&self) -> Result<()> {
@@ -418,11 +477,26 @@ impl Transport for ShmTransportUintr {
         self.request_buffer.write(&payload)
             .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;
 
+        // 记录发送请求前的时间戳
+        let start_time = std::time::Instant::now();
+        
         self.send_uintr_notification()?;
 
-        let result = rx.await
+        let mut result = rx.await
             .map_err(|_| anyhow::anyhow!("Response channel closed for request {}", request_id))??;
 
+        // 计算 gateway 到 backend 的往返延迟
+        let shm_roundtrip_us = start_time.elapsed().as_micros() as i64;
+        result.shm_roundtrip_us = shm_roundtrip_us;
+        
+        // 日志采样：每 LATENCY_LOG_INTERVAL 个请求记录一次
+        let count = LATENCY_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count % LATENCY_LOG_INTERVAL == 0 {
+            // warn!("matrix_multiply(): 请求 {} 的 SHM 往返延迟: {}us (采样率: 1/{})", 
+            //       request_id, shm_roundtrip_us, LATENCY_LOG_INTERVAL);
+            warn!("SHM: {}us", shm_roundtrip_us);
+        }
+        // warn!("SHM: {}us", shm_roundtrip_us);
         Ok(result)
     }
 }

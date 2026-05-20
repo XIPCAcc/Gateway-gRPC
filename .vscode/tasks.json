@@ -4,7 +4,22 @@
         {
             "label": "clean-shm-uintr",
             "type": "shell",
-            "command": "rm -f /dev/shm/gateway_shm_uintr_* && cargo build",
+            "command": "cargo build && rm -f /dev/shm/gateway_shm_uintr_* && pkill -f \"backend\" && pkill -f \"gateway\"",
+            "args": [],
+            "problemMatcher": ["$rustc"],
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            }
+        },
+        {
+            "label": "clean-shm-uintr-release",
+            "type": "shell",
+            "command": "cargo build --release && rm -f /dev/shm/gateway_shm_uintr_* && pkill -f \"backend\" && pkill -f \"gateway\"",
             "args": [],
             "problemMatcher": ["$rustc"],
             "presentation": {

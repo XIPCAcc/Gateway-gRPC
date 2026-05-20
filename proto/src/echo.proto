@@ -46,4 +46,5 @@ message MatrixMultiplyResponse {
   int64 timestamp_ns = 2;
   int64 processing_time_us = 3;
   double gflops = 4;
+  int64 shm_roundtrip_us = 5;
 }

@@ -1,5 +1,5 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 use std::collections::HashMap;
 
@@ -15,6 +15,10 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::{info, debug, warn};
 use uuid::Uuid;
+
+// 日志采样计数器和采样间隔
+static LATENCY_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const LATENCY_LOG_INTERVAL: usize = 10;
 
 use crate::transport::Transport;
 
@@ -322,9 +326,24 @@ impl Transport for ShmTransportEventfd {
         self.request_buffer.write(&payload)
             .map_err(|e| anyhow::anyhow!("Failed to write to shared memory: {}", e))?;
         
+        let start_time = std::time::Instant::now();
+        
         Self::signal_eventfd(&self.request_event)?;
         
-        rx.await
-            .map_err(|_| anyhow::anyhow!("Response channel closed"))?
+        let mut result = rx.await
+            .map_err(|_| anyhow::anyhow!("Response channel closed"))??;
+        
+        let shm_roundtrip_us = start_time.elapsed().as_micros() as i64;
+        result.shm_roundtrip_us = shm_roundtrip_us;
+        
+        // 日志采样：每 LATENCY_LOG_INTERVAL 个请求记录一次
+        let count = LATENCY_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count % LATENCY_LOG_INTERVAL == 0 {
+            // warn!("matrix_multiply(): 请求 {} 的 SHM 往返延迟: {}us (采样率: 1/{})", 
+            //       request_id, shm_roundtrip_us, LATENCY_LOG_INTERVAL);
+            warn!("SHM: {}us", shm_roundtrip_us);
+        }
+        // warn!("SHM: {}us", shm_roundtrip_us);
+        Ok(result)
     }
 }

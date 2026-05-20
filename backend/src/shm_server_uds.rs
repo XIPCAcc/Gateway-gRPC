@@ -200,6 +200,7 @@ impl ShmServerUds {
                                 timestamp_ns: processing_time.as_nanos() as i64,
                                 processing_time_us: processing_time.as_micros() as i64,
                                 gflops,
+                                shm_roundtrip_us: 0,
                             };
                             
                             let response_bytes = bincode::serialize(&response).unwrap();

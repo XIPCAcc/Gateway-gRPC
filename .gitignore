@@ -38,3 +38,7 @@ flamegraph*.svg
 *.o
 *.so
 *.a
+
+*.pyc
+*.pyd
+__pycache__/
