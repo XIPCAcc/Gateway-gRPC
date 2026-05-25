@@ -15,7 +15,7 @@ use nix::libc;
 
 // 日志采样计数器和采样间隔
 static LATENCY_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-const LATENCY_LOG_INTERVAL: usize = 10;
+const LATENCY_LOG_INTERVAL: usize = 1000;
 
 use crate::transport::Transport;
 
@@ -23,6 +23,7 @@ use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sen
 use uintr::connection::setup_client_connection;
 use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
 use uintr::async_wait::{init_token, get_token, uintr_wait, process_global_uintr_wakers, get_notify_count, get_wake_count};
+use uintr::affinity::{pin_current_thread_to_core, get_uipi_core};
 
 enum PendingRequest {
     Echo(oneshot::Sender<Result<EchoResponse>>),
@@ -33,14 +34,13 @@ type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
 
 unsafe extern "C" {
     pub fn ui_handler(ui_frame: *mut uintr::syscall::UintrFrame, vector: u64);
+    static mut uintr_received: libc::c_ulong;
 }
 
 static mut CLIENT_UINTRFD: RawFd = -1;
 static mut CLIENT_UIPI_INDEX: libc::c_int = -1;
 static mut GLOBAL_REQUEST_COUNTER: u64 = 0;
 static mut GLOBAL_RESPONSE_COUNTER: u64 = 0;
-static mut PACKET_COUNTER: u64 = 0;
-static mut LAST_NOTIFY_TIME: Option<std::time::Instant> = None;
 
 fn get_client_uintrfd() -> RawFd {
     unsafe { CLIENT_UINTRFD }
@@ -59,23 +59,6 @@ fn get_client_uipi_index() -> libc::c_int {
 fn set_client_uipi_index(index: libc::c_int) {
     unsafe {
         CLIENT_UIPI_INDEX = index;
-    }
-}
-
-fn get_packet_counter() -> u64 {
-    unsafe { PACKET_COUNTER }
-}
-
-fn set_packet_counter(counter: u64) {
-    unsafe {
-        PACKET_COUNTER = counter;
-    }
-}
-
-fn increment_packet_counter() -> u64 {
-    unsafe {
-        PACKET_COUNTER += 1;
-        PACKET_COUNTER
     }
 }
 
@@ -108,7 +91,12 @@ impl ShmTransportUintr {
         let (done_tx, done_rx) = oneshot::channel();
 
         let uintr_handle = tokio::task::spawn_blocking(move || {
-            init_token("client");
+            let uipi_core = get_uipi_core();
+            if uipi_core != usize::MAX {
+                pin_current_thread_to_core(uipi_core);
+            }
+
+            let token = init_token("client");
 
             match uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY) {
                 Ok(res) => info!("UINTR blocking thread: handler registered: {}", res),
@@ -159,33 +147,33 @@ impl ShmTransportUintr {
             let mut last_notify = get_notify_count();
             let mut last_wake = get_wake_count();
 
-            while running_clone2.load(Ordering::SeqCst) {
+            while running_clone2.load(Ordering::Relaxed) {
+                if unsafe { std::ptr::read_volatile(&raw const uintr_received) > 0 } {
+                    unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                    token.set_pending();
+                    process_global_uintr_wakers();
+                    continue;
+                }
                 match uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0) {
                     Ok(true) => {
-                        let cur_notify = get_notify_count();
-                        debug!(
-                            "UINTR blocking wait: interrupt received (notify_cnt: {} -> {}, +{})",
-                            last_notify, cur_notify, cur_notify - last_notify
-                        );
-                        last_notify = cur_notify;
-                        let woken = process_global_uintr_wakers();
-                        let cur_wake = get_wake_count();
-                        info!(
-                            "UINTR: process_global_uintr_wakers returned {} (wake_cnt: {} -> {}, +{})",
-                            woken, last_wake, cur_wake, cur_wake - last_wake
-                        );
-                        last_wake = cur_wake;
+                        unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                        token.set_pending();
+                        process_global_uintr_wakers();
                     }
                     Ok(false) => {
-                        debug!("UINTR blocking wait: timeout (no interrupt in window)");
+                        if unsafe { std::ptr::read_volatile(&raw const uintr_received) > 0 } {
+                            unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                            token.set_pending();
+                        }
+                        process_global_uintr_wakers();
                     }
-                    Err(e) => {
-                        warn!("UINTR blocking wait error: {}, exiting", e);
+                    Err(_) => {
+                        warn!("UINTR blocking thread: uintr_wait error, exiting");
                         break;
                     }
                 }
             }
-            info!("UINTR blocking wait task exited");
+            warn!("UINTR blocking wait task exited");
         });
 
         done_rx
@@ -392,8 +380,6 @@ impl Transport for ShmTransportUintr {
         let payload = bincode::serialize(&shm_request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize ShmRequest: {}", e))?;
 
-        let was_empty = self.request_buffer.is_empty();
-
         info!("call(): 准备写入 {} 字节到共享内存，请求 {}", payload.len(), request_id);
 
         self.request_buffer.write(&payload)
@@ -403,29 +389,10 @@ impl Transport for ShmTransportUintr {
             GLOBAL_REQUEST_COUNTER += 1;
             GLOBAL_REQUEST_COUNTER
         };
-        let packet_count = increment_packet_counter();
-        
-        let buffer_data_len = self.request_buffer.available_data();
-        let now = std::time::Instant::now();
 
-        let last_notify = unsafe { LAST_NOTIFY_TIME };
-        let time_since_last_notify = last_notify.map(|t| now.duration_since(t)).unwrap_or(std::time::Duration::from_secs(u64::MAX));
-
-        let should_notify = was_empty 
-            || time_since_last_notify >= std::time::Duration::from_millis(10)
-            || packet_count >= 20
-            || buffer_data_len >= 1024 * 1024;
-
-        if should_notify {
-            set_packet_counter(0);
-            unsafe {
-                LAST_NOTIFY_TIME = Some(now);
-            }
-        }
-        
         info!(
-            "call(): 已将请求 {} (全局编号: {}) 写入共享内存, was_empty={}, packet_count={}, buffer_len={}, time_since_notify={:?}", 
-            request_id, global_req_id, was_empty, packet_count, buffer_data_len, time_since_last_notify
+            "call(): 已将请求 {} (全局编号: {}) 写入共享内存",
+            request_id, global_req_id
         );
         self.send_uintr_notification()?;
 

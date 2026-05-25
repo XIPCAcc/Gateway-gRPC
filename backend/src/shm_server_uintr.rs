@@ -14,21 +14,17 @@ use uintr::syscall::{uintr_register_handler, uintr_create_fd, uintr_register_sen
 use uintr::connection::setup_server_connection;
 use uintr::UINTR_HANDLER_FLAG_WAITING_ANY;
 use uintr::async_wait::{init_token, uintr_wait, process_global_uintr_wakers, get_notify_count, get_wake_count};
+use uintr::affinity::{pin_current_thread_to_core, get_uipi_core};
 
 unsafe extern "C" {
     pub fn ui_handler(ui_frame: *mut uintr::syscall::UintrFrame, vector: u64);
+    static mut uintr_received: libc::c_ulong;
 }
 
 static mut SERVER_UINTRFD: RawFd = -1;
 static mut SERVER_UIPI_INDEX: libc::c_int = -1;
 static mut GLOBAL_REQUEST_COUNTER: u64 = 0;
 static mut GLOBAL_RESPONSE_COUNTER: u64 = 0;
-static mut PACKET_COUNTER: u64 = 0;
-static mut LAST_NOTIFY_TIME: Option<std::time::Instant> = None;
-
-fn get_server_uintrfd() -> RawFd {
-    unsafe { SERVER_UINTRFD }
-}
 
 fn set_server_uintrfd(fd: RawFd) {
     unsafe {
@@ -43,23 +39,6 @@ fn get_server_uipi_index() -> libc::c_int {
 fn set_server_uipi_index(index: libc::c_int) {
     unsafe {
         SERVER_UIPI_INDEX = index;
-    }
-}
-
-fn get_packet_counter() -> u64 {
-    unsafe { PACKET_COUNTER }
-}
-
-fn set_packet_counter(counter: u64) {
-    unsafe {
-        PACKET_COUNTER = counter;
-    }
-}
-
-fn increment_packet_counter() -> u64 {
-    unsafe {
-        PACKET_COUNTER += 1;
-        PACKET_COUNTER
     }
 }
 
@@ -118,8 +97,13 @@ impl ShmServerUintr {
         
         let uintr_handle = tokio::task::spawn_blocking(move || {
             info!("UINTR blocking thread: initializing...");
+
+            let uipi_core = get_uipi_core();
+            if uipi_core != usize::MAX {
+                pin_current_thread_to_core(uipi_core);
+            }
             
-            init_token("server");
+            let token = init_token("server");
             
             match uintr_register_handler(ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY) {
                 Ok(res) => info!("UINTR blocking thread: handler registered: {}", res),
@@ -173,36 +157,33 @@ impl ShmServerUintr {
             info!("UINTR blocking thread: entering wait loop");
             let mut last_notify = get_notify_count();
             let mut last_wake = get_wake_count();
-            while running_clone.load(Ordering::SeqCst) {
+            while running_clone.load(Ordering::Relaxed) {
+                if unsafe { std::ptr::read_volatile(&raw const uintr_received) > 0 } {
+                    unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                    token.set_pending();
+                    process_global_uintr_wakers();
+                    continue;
+                }
                 match uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0) {
                     Ok(true) => {
-                        let cur_notify = get_notify_count();
-                        debug!(
-                            "UINTR blocking wait: interrupt received (notify_cnt: {} -> {}, +{})",
-                            last_notify, cur_notify, cur_notify - last_notify
-                        );
-                        last_notify = cur_notify;
-                        let woken = process_global_uintr_wakers();
-                        let cur_wake = get_wake_count();
-                        info!(
-                            "UINTR: process_global_uintr_wakers returned {} (wake_cnt: {} -> {}, +{})",
-                            woken, last_wake, cur_wake, cur_wake - last_wake
-                        );
-                        last_wake = cur_wake;
+                        unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                        token.set_pending();
+                        process_global_uintr_wakers();
                     }
                     Ok(false) => {
-                        debug!("UINTR blocking wait: timeout (no interrupt in window)");
+                        if unsafe { std::ptr::read_volatile(&raw const uintr_received) > 0 } {
+                            unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                            token.set_pending();
+                        }
+                        process_global_uintr_wakers();
                     }
-                    Err(e) => {
-                        warn!("UINTR blocking wait error: {}, exiting", e);
+                    Err(_) => {
+                        warn!("UINTR blocking thread: uintr_wait error, exiting");
                         break;
                     }
                 }
-                // loop {
-                    // notify_global_uintr().unwrap();
-                // }
             }
-            info!("UINTR blocking thread: exited");
+            warn!("UINTR blocking thread: exited");
         });
         
         done_rx.await
@@ -226,6 +207,7 @@ impl ShmServerUintr {
                     
                     // 处理所有待处理的请求
                     let mut processed = 0;
+                    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
                     loop {
                         let n = match request_buffer.read(&mut request_buf) {
                             Ok(n) => {
@@ -277,7 +259,7 @@ impl ShmServerUintr {
                                 
                                 let request_id_clone = request_id.clone();
                                 
-                                tokio::spawn(async move {
+                                handles.push(tokio::spawn(async move {
                                     let start = std::time::Instant::now();
                                     
                                     if delay_clone > Duration::ZERO {
@@ -316,42 +298,15 @@ impl ShmServerUintr {
                                         }
                                     };
                                     
-                                    let was_empty = response_buffer_clone.is_empty();
-                                    
                                     if let Err(e) = response_buffer_clone.write(&payload) {
                                         warn!("Failed to write response: {}", e);
-                                        return;
                                     }
-                                    
-                                    let packet_count = increment_packet_counter();
-
-                                    let buffer_data_len = response_buffer_clone.available_data();
-                                    let now = std::time::Instant::now();
-
-                                    let last_notify = unsafe { LAST_NOTIFY_TIME };
-                                    let time_since_last_notify = last_notify.map(|t| now.duration_since(t)).unwrap_or(std::time::Duration::from_secs(u64::MAX));
-
-                                    let should_notify = was_empty 
-                                        || time_since_last_notify >= std::time::Duration::from_millis(10)
-                                        || packet_count >= 20
-                                        || buffer_data_len >= 1024 * 1024;
-
-                                    if should_notify {
-                                        set_packet_counter(0);
-                                        unsafe {
-                                            LAST_NOTIFY_TIME = Some(now);
-                                        }
-                                    }
-
-                                    if let Err(e) = Self::send_uintr_notification() {
-                                        warn!("Failed to send UINTR notification: {}", e);
-                                    }
-                                });
+                                }));
                             }
                             ShmRequest::MatrixMultiply { id: request_id, matrix_size, data_offset, data_len } => {
                         let data = self.data_pool.read_data(data_offset, data_len as usize).to_vec();
                         
-                        tokio::spawn(async move {
+                        handles.push(tokio::spawn(async move {
                             let start = std::time::Instant::now();
                             
                             let size = matrix_size as usize;
@@ -401,17 +356,21 @@ impl ShmServerUintr {
                                         warn!("Failed to write response: {}", e);
                                         return;
                                     }
-                                    
                                     if let Err(e) = Self::send_uintr_notification() {
                                         warn!("Failed to send UINTR notification: {}", e);
                                     }
-                                });
+                                }));
                             }
                         }
                     }
                     
                     if processed > 0 {
-                        info!("Request listener: 处理了 {} 个请求", processed);
+                        for handle in handles {
+                            let _ = handle.await;
+                        }
+
+                        info!("Request listener: 处理了 {} 个请求，发送批量 UIPI 通知", processed);
+
                     }
                 }
             

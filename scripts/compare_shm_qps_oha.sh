@@ -8,13 +8,10 @@ set -e
 GATEWAY_PORT=8080
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 LOG_DIR="log/matrix_qps_${TIMESTAMP}"
-TEST_DURATION=1
+TEST_DURATION=60
 
 MATRIX_SIZES=(2 4 8 16 32 64 128)
 CONCURRENCIES=(8 8 8 16 16 16 32 32 32 64 64 64 128 128 128 256 256 256)
-
-# MATRIX_SIZES=(2 4 8)
-# CONCURRENCIES=(8 8 16 16)
 
 mkdir -p $LOG_DIR
 
@@ -79,9 +76,11 @@ run_matrix_test() {
     local file_suffix="${run_label:+_}${run_label}"
     local log_file="${LOG_DIR}/${transport_name}_m${matrix_size}_c${concurrency}${file_suffix}.log"
 
-    echo "Running wrk (matrix ${matrix_size}x${matrix_size}, ${concurrency} connections)..."
-    MATRIX_SIZE=${matrix_size} wrk -t8 -c${concurrency} -d${TEST_DURATION}s \
-        -s scripts/wrk_matrix.lua \
+    echo "Running oha (matrix ${matrix_size}x${matrix_size}, ${concurrency} connections)..."
+    oha -z ${TEST_DURATION}s -c ${concurrency} -m POST \
+        -T 'application/json' \
+        -d "{\"matrix_size\":${matrix_size}}" \
+        --no-tui \
         "http://127.0.0.1:${GATEWAY_PORT}/matrix" 2>&1 | tee ${log_file}
 
     kill $GATEWAY_PID $BACKEND_PID 2>/dev/null || true
@@ -135,7 +134,7 @@ echo "Test Duration: ${TEST_DURATION}s each" >> ${SUMMARY_FILE}
 echo "" >> ${SUMMARY_FILE}
 
 printf "%-12s %-8s %-12s %-6s %-14s %-14s\n" \
-    "Transport" "Matrix" "Concurrency" "Run" "QPS(req/s)" "AvgLat(ms)" >> ${SUMMARY_FILE}
+    "Transport" "Matrix" "Concurrency" "Run" "QPS(req/s)" "AvgLat" >> ${SUMMARY_FILE}
 printf "%-12s %-8s %-12s %-6s %-14s %-14s\n" \
     "---------" "------" "----------" "----" "----------" "----------" >> ${SUMMARY_FILE}
 
@@ -150,7 +149,7 @@ for transport in "shm-uds" "shm-eventfd" "shm-uintr"; do
                 run_label=$(echo "$log_file" | sed -n 's/.*_r\([0-9]*\)\.log/\1/p')
                 run_label=${run_label:-1}
                 qps=$(grep "Requests/sec:" "$log_file" | awk '{print $2}')
-                avg_lat=$(grep "Latency" "$log_file" | head -1 | awk '{print $2}')
+                avg_lat=$(grep "Average:" "$log_file" | head -1 | awk '{print $2, $3}')
                 qps=${qps:-"N/A"}
                 avg_lat=${avg_lat:-"N/A"}
                 printf "%-12s %-8s %-12s %-6s %-14s %-14s\n" \

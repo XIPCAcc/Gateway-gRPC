@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 // 日志采样计数器和采样间隔
 static LATENCY_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-const LATENCY_LOG_INTERVAL: usize = 10;
+const LATENCY_LOG_INTERVAL: usize = 1000;
 
 use crate::transport::Transport;
 

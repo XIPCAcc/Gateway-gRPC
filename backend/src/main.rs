@@ -12,6 +12,7 @@ use tonic::{transport::Server, Request, Response, Status};
 use tokio::net::UnixListener;
 use tokio::runtime::Builder;
 use tracing::{info, warn};
+use uintr::affinity::{init_uipi_core, build_tokio_worker_affinity};
 
 use shared_memory::shm::SharedMemoryRingBuffer;
 use shared_memory::ShmConfig as SharedMemConfig;
@@ -239,13 +240,21 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let uipi_core = init_uipi_core();
+    let total_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let worker_threads = if total_cpus > 1 { total_cpus - 1 } else { 1 };
+
     let event_interval: u32 = std::env::var("TOKIO_EVENT_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
 
     let rt = Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .event_interval(event_interval)
+        .on_thread_start(build_tokio_worker_affinity(uipi_core))
         .enable_all()
         .build()?;
 

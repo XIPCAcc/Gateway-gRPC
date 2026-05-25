@@ -16,8 +16,10 @@ use prometheus::{register_counter, register_histogram, Counter, Histogram};
 use proto::{EchoRequest, EchoResponse, MatrixMultiplyRequest, MatrixMultiplyResponse};
 use shared_memory::generate_matrix;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::runtime::Builder;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tracing::{error, info, warn};
+use uintr::affinity::{init_uipi_core, build_tokio_worker_affinity};
 
 mod transport;
 mod metrics;
@@ -292,13 +294,27 @@ async fn run_http_server(
     }
 }
 
-// #[tokio::main]
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let uipi_core = init_uipi_core();
+    let total_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let worker_threads = if total_cpus > 1 { total_cpus - 1 } else { 1 };
+
+    let rt = Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .on_thread_start(build_tokio_worker_affinity(uipi_core))
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
 
     // Create transport based on configuration

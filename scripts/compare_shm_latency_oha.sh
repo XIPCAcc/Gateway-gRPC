@@ -9,11 +9,50 @@ GATEWAY_PORT=8080
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 LOG_DIR="log/matrix_latency_${TIMESTAMP}"
 TEST_DURATION=60
+BPFTRACE_ENABLE=${BPFTRACE_ENABLE:-0}
+BPFTRACE_DURATION=$((TEST_DURATION + 20))
 
-MATRIX_SIZES=(2 4 8 16 32 64 128)
-CONCURRENCIES=(8 8 8 16 16 16 32 32 32 64 64 64 128 128 128 256 256 256)
+MATRIX_SIZES=(2)
+CONCURRENCIES=(8)
 
 mkdir -p $LOG_DIR
+
+if [ "$BPFTRACE_ENABLE" = "1" ]; then
+    BPFTRACE_LOG="${LOG_DIR}/bpftrace.log"
+    echo "Starting bpftrace (${BPFTRACE_DURATION}s)..."
+    sudo bpftrace -e "
+        uprobe:target/release/backend:rust_interrupt_callback { @irq_backend++; }
+        uprobe:target/release/backend:*uintr_wait* { @wait_backend++; }
+        uprobe:target/release/backend:*process_global_uintr_wakers* { @wakers_backend++; }
+        uprobe:target/release/gateway:rust_interrupt_callback { @irq_gateway++; }
+        uprobe:target/release/gateway:*uintr_wait* { @wait_gateway++; }
+        uprobe:target/release/gateway:*process_global_uintr_wakers* { @wakers_gateway++; }
+        uprobe:target/release/gateway:*senduipi* { @send_uipi_gateway++; }
+        uprobe:target/release/backend:*senduipi* { @send_uipi_backend++; }
+        uprobe:target/release/gateway:*ui_handler* { @ui_handler_gateway++; }
+        uprobe:target/release/backend:*ui_handler* { @ui_handler_backend++; }
+
+        interval:s:${BPFTRACE_DURATION} {
+            printf(\"=== %ds report ===\n\", ${BPFTRACE_DURATION});
+            printf(\"--- Backend ---\n\");
+            printf(\"intr_callback: %d\n\", @irq_backend);
+            printf(\"ui_handler: %d\n\", @ui_handler_backend);
+            printf(\"uintr_wait:     %d\n\", @wait_backend);
+            printf(\"wakers:         %d\n\", @wakers_backend);
+            printf(\"send_uipi: %d\n\", @send_uipi_backend);
+            printf(\"--- Gateway ---\n\");
+            printf(\"intr_callback: %d\n\", @irq_gateway);
+            printf(\"ui_handler: %d\n\", @ui_handler_gateway);
+            printf(\"uintr_wait:     %d\n\", @wait_gateway);
+            printf(\"wakers:         %d\n\", @wakers_gateway);
+            printf(\"send_uipi: %d\n\", @send_uipi_gateway);
+            exit();
+        }
+    " > "${BPFTRACE_LOG}" 2>&1 &
+    BPFTRACE_PID=$!
+    echo "bpftrace PID: ${BPFTRACE_PID}"
+    sleep 3
+fi
 
 echo "Recompiling..."
 cargo build --release 2>&1 | tail -3
@@ -81,9 +120,11 @@ run_matrix_test() {
     local file_suffix="${run_label:+_}${run_label}"
     local log_file="${LOG_DIR}/${transport_name}_m${matrix_size}_c${concurrency}${file_suffix}.log"
 
-    echo "Running wrk (matrix ${matrix_size}x${matrix_size}, ${concurrency} connections)..."
-    MATRIX_SIZE=${matrix_size} wrk -t8 -c${concurrency} -d${TEST_DURATION}s \
-        -s scripts/wrk_matrix.lua \
+    echo "Running oha (matrix ${matrix_size}x${matrix_size}, ${concurrency} connections)..."
+    oha -z ${TEST_DURATION}s -c ${concurrency} -m POST \
+        -T 'application/json' \
+        -d "{\"matrix_size\":${matrix_size}}" \
+        --no-tui \
         "http://127.0.0.1:${GATEWAY_PORT}/matrix" 2>&1 | tee ${log_file}
 
     kill $GATEWAY_PID $BACKEND_PID 2>/dev/null || true
@@ -106,9 +147,10 @@ for matrix_size in "${MATRIX_SIZES[@]}"; do
         run_count[$run_count_key]=$(( ${run_count[$run_count_key]:-0} + 1 ))
         run_label="r${run_count[$run_count_key]}"
 
-        run_matrix_test "shm-uds"     "shm-uds"     "shm-uds"     $matrix_size $concurrency $run_label || true
-        run_matrix_test "shm-eventfd" "shm-eventfd" "shm-eventfd" $matrix_size $concurrency $run_label || true
         run_matrix_test "shm-uintr"   "shm-uintr"   "shm-uintr"   $matrix_size $concurrency $run_label || true
+        run_matrix_test "shm-eventfd" "shm-eventfd" "shm-eventfd" $matrix_size $concurrency $run_label || true
+        run_matrix_test "shm-uds"     "shm-uds"     "shm-uds"     $matrix_size $concurrency $run_label || true
+
     done
 done
 
@@ -118,3 +160,10 @@ echo "All Matrix Multiplication Tests Complete!"
 echo "=========================================="
 echo ""
 echo "Results saved to: ${LOG_DIR}/"
+
+if [ "$BPFTRACE_ENABLE" = "1" ] && [ -n "${BPFTRACE_PID:-}" ]; then
+    wait $BPFTRACE_PID 2>/dev/null || true
+    echo ""
+    echo "bpftrace results:"
+    cat "${BPFTRACE_LOG}"
+fi
