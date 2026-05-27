@@ -67,5 +67,39 @@
             "cwd": "${workspaceFolder}",
             // "preLaunchTask": "cargo build"
         },
+
+        // eventfd
+        {
+            "name": "Release backend (shm-eventfd)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/release/backend",
+            "args": [
+                "--transport", "shm-eventfd",
+                "--shm-name", "gateway_shm_uintr_test_manual",
+            ],
+            "env": {
+                // "RUST_LOG": "info"
+                // "RUST_LOG": "warn"
+            },
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "clean-shm-uintr-release"
+        },
+        {
+            "name": "Release gateway (shm-eventfd)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/release/gateway",
+            "args": [
+                "--transport", "shm-eventfd",
+                "--shm-name", "gateway_shm_uintr_test_manual",
+            ],
+            "env": {
+                // "RUST_LOG": "info"
+                "RUST_LOG": "warn"
+            },
+            "cwd": "${workspaceFolder}",
+            // "preLaunchTask": "cargo build"
+        },
     ]
 }

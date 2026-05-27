@@ -306,10 +306,11 @@ fn main() -> Result<()> {
     let worker_threads = if total_cpus > 1 { total_cpus - 1 } else { 1 };
 
     let rt = Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .on_thread_start(build_tokio_worker_affinity(uipi_core))
         .enable_all()
         .build()?;
+        // .worker_threads(worker_threads)
+        // .event_interval(event_interval)
+        // .on_thread_start(build_tokio_worker_affinity(uipi_core))
 
     rt.block_on(async_main())
 }

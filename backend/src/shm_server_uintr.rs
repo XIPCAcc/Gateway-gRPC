@@ -164,24 +164,25 @@ impl ShmServerUintr {
                     process_global_uintr_wakers();
                     continue;
                 }
-                match uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0) {
-                    Ok(true) => {
-                        unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
-                        token.set_pending();
-                        process_global_uintr_wakers();
-                    }
-                    Ok(false) => {
-                        if unsafe { std::ptr::read_volatile(&raw const uintr_received) > 0 } {
-                            unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
-                            token.set_pending();
-                        }
-                        process_global_uintr_wakers();
-                    }
-                    Err(_) => {
-                        warn!("UINTR blocking thread: uintr_wait error, exiting");
-                        break;
-                    }
-                }
+                let _ = uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0);
+                // match uintr::syscall::uintr_wait(uintr::UINTR_WAIT_MAX_USEC, 0) {
+                //     Ok(true) => {
+                //         unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                //         token.set_pending();
+                //         process_global_uintr_wakers();
+                //     }
+                //     Ok(false) => {
+                //         if unsafe { std::ptr::read_volatile(&raw const uintr_received) > 0 } {
+                //             unsafe { std::ptr::write_volatile(&raw mut uintr_received, 0); }
+                //             token.set_pending();
+                //         }
+                //         process_global_uintr_wakers();
+                //     }
+                //     Err(_) => {
+                //         warn!("UINTR blocking thread: uintr_wait error, exiting");
+                //         break;
+                //     }
+                // }
             }
             warn!("UINTR blocking thread: exited");
         });
@@ -364,14 +365,14 @@ impl ShmServerUintr {
                         }
                     }
                     
-                    if processed > 0 {
-                        for handle in handles {
-                            let _ = handle.await;
-                        }
+                    // if processed > 0 {
+                        // for handle in handles {
+                        //     let _ = handle.await;
+                        // }
 
-                        info!("Request listener: 处理了 {} 个请求，发送批量 UIPI 通知", processed);
+                    //     info!("Request listener: 处理了 {} 个请求，发送批量 UIPI 通知", processed);
 
-                    }
+                    // }
                 }
             
             info!("Request listener thread exited");

@@ -252,11 +252,12 @@ fn main() -> Result<()> {
         .unwrap_or(64);
 
     let rt = Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .event_interval(event_interval)
-        .on_thread_start(build_tokio_worker_affinity(uipi_core))
         .enable_all()
         .build()?;
+        // .worker_threads(worker_threads)
+        // .event_interval(event_interval)
+        // .on_thread_start(build_tokio_worker_affinity(uipi_core))
+
 
     rt.block_on(async_main(args))
 }
