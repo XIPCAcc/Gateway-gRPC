@@ -8,10 +8,10 @@ set -e
 GATEWAY_PORT=8080
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 LOG_DIR="log/matrix_${TIMESTAMP}"
-TEST_DURATION=15
+TEST_DURATION=60
 
 MATRIX_SIZES=(2 4 8 16 32 64 128 256 512)
-CONCURRENCIES=(16 32 64 128 256 512 1024)
+CONCURRENCIES=(8 16 32 64 128 256 512 1024)
 
 mkdir -p $LOG_DIR
 
@@ -85,10 +85,6 @@ run_matrix_test() {
 
 for matrix_size in "${MATRIX_SIZES[@]}"; do
     for concurrency in "${CONCURRENCIES[@]}"; do
-        if [ $matrix_size -ge 256 ] && [ $concurrency -ge 512 ]; then
-            echo "Skipping matrix=${matrix_size} concurrency=${concurrency} (too heavy)"
-            continue
-        fi
 
         run_matrix_test "shm-uds"     "shm-uds"     "shm-uds"     $matrix_size $concurrency || true
         run_matrix_test "shm-eventfd" "shm-eventfd" "shm-eventfd" $matrix_size $concurrency || true
@@ -125,9 +121,7 @@ printf "%-12s %-8s %-12s %-14s %-14s %-14s\n" "---------" "------" "----------" 
 for transport in "shm-uds" "shm-eventfd" "shm-uintr"; do
     for matrix_size in "${MATRIX_SIZES[@]}"; do
         for concurrency in "${CONCURRENCIES[@]}"; do
-            if [ $matrix_size -ge 256 ] && [ $concurrency -ge 512 ]; then
-                continue
-            fi
+
             log_file="${LOG_DIR}/${transport}_m${matrix_size}_c${concurrency}.log"
             if [ -f "$log_file" ]; then
                 qps=$(grep "Requests/sec:" "$log_file" | awk '{print $2}')
